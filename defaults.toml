@@ -2,11 +2,11 @@
 # No spaces before/after the '='!
 #
 # Default model language
-default_language='english'
+default_language='en-us'
 # Default model size
-default_model='small'
+default_model='large'
 # Defaults to the system's PATH. You can specify a full path in single '' quotes
-ffmpeg_path='ffmpeg'
+ffmpeg_path='/opt/homebrew/bin/ffmpeg'
 # Change this to true if you always want the script to generate a cue file
 generate_cue_file='False'
 # Set this to the cue file path you want to use. Useful for continuous edits and script runs where the cue file

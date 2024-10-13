@@ -931,6 +931,9 @@ def read_cue_file(cue_path: PathLike) -> list[dict] | None:
         except (ValueError, IndexError) as e:
             con.print(f"[bold red]ERROR:[/] Failed to match line: [red]{e}[/]. Returning...")
             return None
+        except Exception as e:
+            con.print(f"[bold red]ERROR:[/] Failed to match line: [red]{e}[/]. Returning...")
+            return None
 
         if 'TRACK' in content[i+1] and time_dict:
             timecodes.append(time_dict)
