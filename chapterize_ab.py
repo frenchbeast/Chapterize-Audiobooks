@@ -366,6 +366,8 @@ def parse_args():
                         help='Generate a cue file in the audiobook directory for editing chapter markers. Can also be set in defaults.toml. Default disabled')
     parser.add_argument('--cue_path', '-cp', nargs='?', default=None, metavar='CUE_PATH', type=path_exists,
                         help='Path to cue file in non-default location (i.e., not in the audiobook directory) containing chapter timecodes. Can also be set in defaults.toml, which has lesser precedence than this argument')
+    parser.add_argument('--use-existing-chapters', '-uec', action='store_true', dest='use_existing',
+                        help='For M4B files: automatically use existing embedded chapters without prompting')
 
     args = parser.parse_args()
     config = parse_config()
@@ -470,7 +472,7 @@ def parse_args():
     # Get ffmpeg path
     ffmpeg = get_ffmpeg_path(config)
 
-    return args.audiobook, meta_fields, language, model_name, model_type, cue_file, ffmpeg
+    return args.audiobook, meta_fields, language, model_name, model_type, cue_file, ffmpeg, args.use_existing
 
 
 def build_progress(bar_type: str) -> Progress:
@@ -1170,7 +1172,7 @@ def main():
         sys.exit(20)
 
     # Destructure tuple
-    audiobook_file, in_metadata, lang, model_name, model_type, cue_file, ffmpeg = parse_args()
+    audiobook_file, in_metadata, lang, model_name, model_type, cue_file, ffmpeg, use_existing_chapters = parse_args()
 
     # Check supported file formats
     supported_formats = ['.mp3', '.m4b', '.m4a']
@@ -1209,12 +1211,21 @@ def main():
                 print_table(timecodes)
                 print("\n")
 
-                # Ask user if they want to use existing chapters
-                con.print("[yellow]M4B file already has chapters. Options:[/]")
-                con.print("  1. Use existing chapters (fast, recommended)")
-                con.print("  2. Re-detect chapters with ML (slow, may find different breaks)")
-
-                choice = input("\nChoice [1/2] (default: 1): ").strip() or "1"
+                # Determine whether to use existing chapters
+                if use_existing_chapters:
+                    # Flag set - use existing chapters without prompting
+                    con.print("[cyan]Using existing chapters (--use-existing-chapters flag set)[/]")
+                    choice = "1"
+                elif not sys.stdin.isatty():
+                    # Running non-interactively - auto-select existing chapters
+                    con.print("[cyan]Non-interactive mode detected - using existing chapters[/]")
+                    choice = "1"
+                else:
+                    # Interactive mode - ask user
+                    con.print("[yellow]M4B file already has chapters. Options:[/]")
+                    con.print("  1. Use existing chapters (fast, recommended)")
+                    con.print("  2. Re-detect chapters with ML (slow, may find different breaks)")
+                    choice = input("\nChoice [1/2] (default: 1): ").strip() or "1"
 
                 if choice == "1":
                     # Use existing chapters - skip to file splitting
