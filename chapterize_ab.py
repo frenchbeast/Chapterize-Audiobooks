@@ -41,6 +41,17 @@ from model.models import (
     get_language_features
 )
 
+# Optional imports for alternative detection methods
+try:
+    from chapter_detection_alternatives import (
+        detect_by_silence,
+        detect_by_whisper,
+        detect_hybrid
+    )
+    ALTERNATIVES_AVAILABLE = True
+except ImportError:
+    ALTERNATIVES_AVAILABLE = False
+
 '''
     Constants
 '''
@@ -368,6 +379,13 @@ def parse_args():
                         help='Path to cue file in non-default location (i.e., not in the audiobook directory) containing chapter timecodes. Can also be set in defaults.toml, which has lesser precedence than this argument')
     parser.add_argument('--use-existing-chapters', '-uec', action='store_true', dest='use_existing',
                         help='For M4B files: automatically use existing embedded chapters without prompting')
+    parser.add_argument('--detection-method', '-dm2', dest='detection_method',
+                        choices=['auto', 'vosk', 'whisper', 'hybrid', 'silence'],
+                        default='auto',
+                        help='Chapter detection method. "auto" intelligently chooses the best method: '
+                             'M4B embedded chapters > faster-whisper > Vosk fallback. '
+                             'Manual options: vosk (slow, default ML), whisper (5-10x faster), '
+                             'hybrid (silence + selective transcription), silence (fastest, no ML)')
 
     args = parser.parse_args()
     config = parse_config()
@@ -472,7 +490,7 @@ def parse_args():
     # Get ffmpeg path
     ffmpeg = get_ffmpeg_path(config)
 
-    return args.audiobook, meta_fields, language, model_name, model_type, cue_file, ffmpeg, args.use_existing
+    return args.audiobook, meta_fields, language, model_name, model_type, cue_file, ffmpeg, args.use_existing, args.detection_method
 
 
 def build_progress(bar_type: str) -> Progress:
@@ -858,6 +876,126 @@ def split_file(audiobook_path: Path,
             progress.update(task, advance=1)
 
 
+def generate_timecodes_smart(audiobook_path: Path,
+                            language: str,
+                            model_type: str,
+                            detection_method: str = 'auto') -> list[dict]:
+    """
+    Generate chapter timecodes using the specified or auto-detected method.
+
+    Supports multiple detection methods:
+    - auto: Intelligently choose best method (faster-whisper > Vosk fallback)
+    - vosk: Traditional Vosk ML transcription (slow but reliable)
+    - whisper: faster-whisper transcription (5-10x faster)
+    - hybrid: Silence detection + selective transcription
+    - silence: Pure silence detection (fastest, no ML)
+
+    :param audiobook_path: Path to input audiobook file
+    :param language: Language code for transcription
+    :param model_type: Model size (small/large)
+    :param detection_method: Detection method to use
+    :return: List of chapter dictionaries
+    :raises SystemExit: If method fails or dependencies missing
+    """
+    # Auto-detection logic
+    if detection_method == 'auto':
+        con.print("[cyan]Auto-detecting best chapter detection method...[/cyan]")
+
+        # Check if faster-whisper is available
+        try:
+            from faster_whisper import WhisperModel
+            detection_method = 'whisper'
+            con.print("[green]✓[/] faster-whisper available - using whisper method (5-10x faster)")
+        except ImportError:
+            detection_method = 'vosk'
+            con.print("[yellow]![/] faster-whisper not available - falling back to vosk")
+            con.print("[yellow]TIP:[/] Install faster-whisper for better performance: pip install faster-whisper")
+
+        print("\n")
+
+    # Execute the chosen method
+    if detection_method == 'vosk':
+        # Use traditional Vosk method
+        con.rule("[cyan]Generating Timecodes (Vosk ML)[/cyan]")
+        print("\n")
+
+        if model_type == 'small':
+            message = "[magenta]Sit tight, this might take a while[/magenta]..."
+        else:
+            message = "[magenta]Sit tight, this might take a [u]long[/u] while[/magenta]..."
+
+        with con.status(message, spinner='pong'):
+            timecodes_file = generate_timecodes(audiobook_path, language, model_type)
+
+        # Parse the SRT file
+        try:
+            with open(timecodes_file, 'r', encoding='utf-8') as fp:
+                file_lines = fp.readlines()
+        except (OSError, UnicodeDecodeError) as e:
+            con.print(f"[bold red]ERROR:[/] Failed to read timecodes file: {e}")
+            sys.exit(10)
+
+        con.rule("[cyan]Parsing Timecodes[/cyan]")
+        print("\n")
+
+        timecodes = parse_timecodes(file_lines, language)
+        con.print("[bold green]SUCCESS![/] Timecodes parsed")
+
+        return timecodes
+
+    elif detection_method in ['whisper', 'hybrid', 'silence']:
+        # Use alternative detection methods
+        if not ALTERNATIVES_AVAILABLE:
+            con.print(
+                "[bold red]ERROR:[/] Alternative detection methods not available. "
+                "Missing chapter_detection_alternatives.py module."
+            )
+            sys.exit(15)
+
+        # Map detection method to function
+        method_map = {
+            'whisper': ('faster-whisper', detect_by_whisper),
+            'hybrid': ('Hybrid (silence + ML)', detect_hybrid),
+            'silence': ('Silence Detection', detect_by_silence)
+        }
+
+        method_name, method_func = method_map[detection_method]
+        con.rule(f"[cyan]Generating Timecodes ({method_name})[/cyan]")
+        print("\n")
+
+        try:
+            # Call the detection function
+            if detection_method == 'whisper':
+                # Map model_type to whisper model size
+                whisper_model = 'base' if model_type == 'small' else 'small'
+                timecodes = method_func(audiobook_path, model_size=whisper_model, language=language[:2])
+            elif detection_method == 'hybrid':
+                timecodes = method_func(audiobook_path, model_size='tiny')
+            else:  # silence
+                timecodes = method_func(audiobook_path)
+
+            con.print(f"[bold green]SUCCESS![/] {len(timecodes)} chapters detected using {method_name}")
+            return timecodes
+
+        except ImportError as e:
+            con.print(f"[bold red]ERROR:[/] Missing dependencies for {method_name}: {e}")
+            con.print("\n[yellow]Install dependencies:[/]")
+            if detection_method == 'whisper':
+                con.print("  pip install faster-whisper")
+            elif detection_method == 'hybrid':
+                con.print("  pip install pydub faster-whisper")
+            else:  # silence
+                con.print("  pip install pydub")
+            sys.exit(16)
+        except Exception as e:
+            con.print(f"[bold red]ERROR:[/] {method_name} failed: {e}")
+            sys.exit(17)
+
+    else:
+        con.print(f"[bold red]ERROR:[/] Unknown detection method: {detection_method}")
+        sys.exit(18)
+
+
 def generate_timecodes(audiobook_path: Path, language: str, model_type: str) -> Path:
     """Generate chapter timecodes using vosk Machine Learning API.
 
@@ -1172,7 +1310,7 @@ def main():
         sys.exit(20)
 
     # Destructure tuple
-    audiobook_file, in_metadata, lang, model_name, model_type, cue_file, ffmpeg, use_existing_chapters = parse_args()
+    audiobook_file, in_metadata, lang, model_name, model_type, cue_file, ffmpeg, use_existing_chapters, detection_method = parse_args()
 
     # Check supported file formats
     supported_formats = ['.mp3', '.m4b', '.m4a']
@@ -1306,45 +1444,8 @@ def main():
 
     # Generate timecodes from audio file (skip if already have from M4B)
     if 'timecodes' not in locals() or timecodes is None:
-        con.rule("[cyan]Generating Timecodes[/cyan]")
-        print("\n")
-
-        if model_type == 'small':
-            message = "[magenta]Sit tight, this might take a while[/magenta]..."
-        else:
-            message = "[magenta]Sit tight, this might take a [u]long[/u] while[/magenta]..."
-
-        with con.status(message, spinner='pong'):
-            timecodes_file = generate_timecodes(audiobook_file, lang, model_type)
-
-        # If cue file exists, read timecodes from file
-        if cue_file and cue_file.exists():
-            con.rule("[cyan]Reading Cue File[/cyan]")
-            print("\n")
-
-            if (cue_timecodes := read_cue_file(cue_file)) is not None:
-                con.print("[bold green]SUCCESS![/] Timecodes parsed from cue file")
-                timecodes = cue_timecodes
-            else:
-                timecodes = None
-        else:
-            timecodes = None
-
-        # If timecodes not parsed from cue file, parse from srt
-        if not timecodes:
-            # Open file and parse timecodes
-            try:
-                with open(timecodes_file, 'r', encoding='utf-8') as fp:
-                    file_lines = fp.readlines()
-            except (OSError, UnicodeDecodeError) as e:
-                con.print(f"[bold red]ERROR:[/] Failed to read timecodes file: {e}")
-                sys.exit(10)
-
-            con.rule("[cyan]Parsing Timecodes[/cyan]")
-            print("\n")
-
-            timecodes = parse_timecodes(file_lines, lang)
-            con.print("[bold green]SUCCESS![/] Timecodes parsed")
+        # Use smart detection to choose best method
+        timecodes = generate_timecodes_smart(audiobook_file, lang, model_type, detection_method)
 
         # Print timecodes table
         print("\n")
