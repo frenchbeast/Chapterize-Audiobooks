@@ -420,6 +420,21 @@ def main():
         parser.print_help()
         return 1
 
+    # Verify file exists for all commands
+    if hasattr(args, 'm4b_file'):
+        if not args.m4b_file.exists():
+            print("\n" + "="*60)
+            print("ERROR: File not found")
+            print("="*60)
+            print(f"\nFile: {args.m4b_file}")
+            print("\nPlease check:")
+            print("  - The file path is correct")
+            print("  - The file exists at the specified location")
+            print("  - You have permission to access the file")
+            print("\nSupported formats: .m4b, .m4a")
+            print("="*60 + "\n")
+            return 1
+
     # Execute command
     if args.command == 'extract':
         chapters = get_m4b_chapters(args.m4b_file)

@@ -346,7 +346,18 @@ def main():
     args = parser.parse_args()
 
     if not args.audiobook.exists():
-        print(f"Error: File not found: {args.audiobook}")
+        print("\n" + "="*60)
+        print("ERROR: File not found")
+        print("="*60)
+        print(f"\nFile: {args.audiobook}")
+        print("\nPlease check:")
+        print("  - The file path is correct")
+        print("  - The file exists at the specified location")
+        print("  - You have permission to access the file")
+        print("\nSupported formats: .mp3, .m4b, .m4a")
+        print("\nExample usage:")
+        print(f"  python {Path(__file__).name} audiobook.mp3 --method whisper")
+        print("="*60 + "\n")
         return 1
 
     # Detect chapters using selected method

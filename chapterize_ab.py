@@ -116,13 +116,21 @@ def path_exists(path: Path | str) -> Path:
 
     :param path: File path to verify
     :return: The tested file path if it exists
-    :raises FileNotFoundError: If the path does not exist
+    :raises argparse.ArgumentTypeError: If the path does not exist
     """
     path_obj = Path(path)
     if path_obj.exists():
         return path_obj
     else:
-        raise FileNotFoundError(f"The path: <{path}> does not exist")
+        # Use ArgumentTypeError for better argparse integration
+        raise argparse.ArgumentTypeError(
+            f"\n\n"
+            f"  File not found: {path}\n\n"
+            f"  Please check:\n"
+            f"    - The file path is correct\n"
+            f"    - The file exists at the specified location\n"
+            f"    - You have permission to access the file\n"
+        )
 
 
 def verify_language(language: str) -> str:
@@ -361,6 +369,17 @@ def parse_args():
 
     args = parser.parse_args()
     config = parse_config()
+
+    # Check if audiobook file was provided
+    if not args.audiobook:
+        con.print("\n[bold red]ERROR:[/] No audiobook file specified\n")
+        con.print("[yellow]Usage:[/]")
+        con.print("  python chapterize_ab.py <audiobook_file> [options]\n")
+        con.print("[yellow]Example:[/]")
+        con.print("  python chapterize_ab.py audiobook.mp3 --title \"My Book\"\n")
+        con.print("[yellow]Supported formats:[/] .mp3, .m4b, .m4a\n")
+        parser.print_help()
+        sys.exit(1)
 
     if args.list_languages:
         con.print(Panel(Pretty(model_languages), title="Supported Languages & Codes"))
