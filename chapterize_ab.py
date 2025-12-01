@@ -786,15 +786,20 @@ def split_file(audiobook_path: Path,
 
     command = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'info', '-i', str(audiobook_path)]
 
-    # ID3v2 is only for MP3 files, not M4B/M4A
-    if cover_art:
-        command.extend(['-i', str(cover_art)])
-        if output_ext == '.mp3':
-            command.extend(['-id3v2_version', '3', '-metadata:s:v', 'comment="Cover (front)"'])
+    # Handle cover art and stream mapping
+    # Note: M4B/M4A containers don't support adding JPEG cover art via stream mapping
+    # Cover art in M4B files is usually already embedded in the source
+    if cover_art and output_ext == '.mp3':
+        # MP3: Add cover art via ID3v2 tags
+        command.extend(['-i', str(cover_art), '-id3v2_version', '3', '-metadata:s:v', 'comment="Cover (front)"'])
         stream = ['-map', '0:0', '-map', '1:0', '-c', 'copy']
+    elif output_ext == '.mp3':
+        # MP3 without cover art
+        command.extend(['-id3v2_version', '3'])
+        stream = ['-c', 'copy']
     else:
-        if output_ext == '.mp3':
-            command.extend(['-id3v2_version', '3'])
+        # M4B/M4A: Just copy audio stream, skip external cover art
+        # (Cover art from source M4B is preserved automatically with -c copy)
         stream = ['-c', 'copy']
 
     # Handle metadata strings if they exist
