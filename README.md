@@ -4,7 +4,7 @@
 
 # Chapterize-Audiobooks
 
-Split a single, monolithic mp3 audiobook file into chapters using Machine Learning and ffmpeg.
+Split a single, monolithic audiobook file into chapters using Machine Learning and ffmpeg. Supports MP3, M4B, and M4A formats with intelligent auto-detection of the fastest method available.
 
 ![demo](https://user-images.githubusercontent.com/47511320/196572033-80cfe70c-eb57-4789-a7be-fcb2a03f18c5.gif)
 
@@ -40,7 +40,21 @@ You can use this as an intermediary step for creating .m4b files, or keep the fi
 
 ### Machine Learning
 
-The script utilizes the `vosk-api` machine learning library which performs a speech-to-text conversion on the audiobook file, generating timestamps throughout which are stored in a srt (subrip) file. The file is then parsed, searching for phrases like "prologue", "chapter", and "epilogue", which are used as separators for the generated chapter files.
+The script uses multiple machine learning approaches for chapter detection. By default, it automatically selects the fastest available method (`--detection-method auto`):
+
+1. **M4B/M4A Files**: Instant extraction of existing embedded chapters (no ML needed, ~seconds)
+2. **faster-whisper**: 5-10x faster than Vosk with better accuracy (recommended for MP3, requires optional dependencies)
+3. **Vosk**: Traditional ML method (slower but works without additional dependencies)
+4. **Hybrid**: Silence detection + selective transcription (smart, fast)
+5. **Silence**: Pure silence detection (fastest, but may miss soft-spoken chapters)
+
+The script analyzes your audiobook file to generate timestamps throughout, stored in an SRT (subrip) file. It searches for phrases like "prologue", "chapter", and "epilogue" to determine chapter boundaries.
+
+### Supported Formats
+
+- **MP3**: Traditional audiobook format, requires ML transcription
+- **M4B/M4A**: MPEG-4 Audio Book format with embedded chapters (instant extraction!)
+- All formats: Output matches input to preserve codec quality (M4B→M4B, MP3→MP3)
 
 ### Models
 
@@ -94,20 +108,27 @@ cue_path=''
 
 - [ffmpeg](https://ffmpeg.org/)
 - [python](https://www.python.org/downloads/) 3.10+
-  - Packages:
+  - Required Packages:
     - [rich](https://github.com/Textualize/rich)
     - [vosk](https://github.com/alphacep/vosk-api)
     - [requests](https://requests.readthedocs.io/en/latest/) (if you want to download models)
+  - Optional Packages (for faster detection methods):
+    - [faster-whisper](https://github.com/guillaumekln/faster-whisper) (5-10x faster than Vosk, recommended!)
+    - [pydub](https://github.com/jiaaro/pydub) (for silence detection and hybrid methods)
 
 To install python dependencies, open a command shell and type the following:
 
 > **NOTE**: If you're on Linux, you might need to use `pip3` instead
 
 ```bash
-# Using the requirements file (recommended)
+# Using the requirements file (recommended - installs required packages only)
 pip install -r requirements.txt
-# Manually installing packages
-pip install vosk rich requests
+
+# Install optional packages for faster methods (highly recommended!)
+pip install -r requirements-optional.txt
+
+# Or manually install everything
+pip install vosk rich requests faster-whisper pydub
 ```
 
 ### ffmpeg
@@ -268,7 +289,30 @@ optional arguments:
 > **NOTE**: Each argument has a shortened alias. Most examples use the full argument name for clarity, but it's often more convenient in practice to use the aliases
 
 ```bash
-# Adding the title and genre metadata fields 
+# M4B file with existing chapters (instant extraction, ~seconds)
+~$ python3 ./chapterize_ab.py '/path/to/audiobook/file.m4b' --title 'Book Title'
+# Auto-detects M4B format, extracts embedded chapters, splits into M4B chapter files
+```
+
+```bash
+# MP3 file with auto-detection (uses faster-whisper if available, falls back to Vosk)
+~$ python3 ./chapterize_ab.py '/path/to/audiobook/file.mp3' --title 'Book Title'
+# Automatically selects the fastest available detection method
+```
+
+```bash
+# Force a specific detection method (whisper is 5-10x faster than vosk)
+~$ python3 ./chapterize_ab.py '/path/to/audiobook/file.mp3' --detection-method whisper
+# Options: auto (default), vosk, whisper, hybrid, silence
+```
+
+```bash
+# M4B file: use existing chapters without prompting (for automation/scripts)
+~$ python3 ./chapterize_ab.py '/path/to/audiobook/file.m4b' --use-existing-chapters
+```
+
+```bash
+# Adding the title and genre metadata fields
 ~$ python3 ./chapterize_ab.py '/path/to/audiobook/file.mp3' --title 'Game of Thrones' --genre 'Fantasy'
 ```
 
