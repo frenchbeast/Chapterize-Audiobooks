@@ -1133,14 +1133,84 @@ def main():
     # Destructure tuple
     audiobook_file, in_metadata, lang, model_name, model_type, cue_file, ffmpeg = parse_args()
 
-    if not str(audiobook_file).endswith('.mp3'):
-        con.print("[bold red]ERROR:[/] The script only works with .mp3 files (for now)")
+    # Check supported file formats
+    supported_formats = ['.mp3', '.m4b', '.m4a']
+    file_ext = audiobook_file.suffix.lower()
+
+    if file_ext not in supported_formats:
+        con.print(f"[bold red]ERROR:[/] Unsupported format: {file_ext}")
+        con.print(f"[yellow]Supported formats:[/] {', '.join(supported_formats)}")
         sys.exit(9)
 
-    # Extract metadata from input file
-    con.rule("[cyan]Extracting metadata[/cyan]")
-    print("\n")
-    parsed_metadata = extract_metadata(audiobook_file, ffmpeg)
+    # Try to extract existing chapters from M4B/M4A files first
+    if file_ext in ['.m4b', '.m4a']:
+        con.print(f"[cyan]M4B/M4A file detected:[/] {audiobook_file.name}")
+        con.print("[magenta]Checking for existing chapter markers...[/]")
+
+        try:
+            from m4b_support import get_m4b_chapters, get_m4b_metadata
+
+            # Try to extract existing chapters
+            existing_chapters = get_m4b_chapters(audiobook_file, ffmpeg)
+
+            if existing_chapters:
+                con.print(f"[bold green]SUCCESS![/] Found {len(existing_chapters)} embedded chapters")
+                print("\n")
+                timecodes = existing_chapters
+
+                # Also extract M4B metadata
+                m4b_metadata = get_m4b_metadata(audiobook_file)
+                if m4b_metadata:
+                    con.print("[magenta]Merging M4B metadata...[/]")
+                    parsed_metadata = m4b_metadata
+                    if in_metadata:
+                        parsed_metadata |= in_metadata
+
+                # Skip transcription, go directly to printing chapters
+                print_table(timecodes)
+                print("\n")
+
+                # Ask user if they want to use existing chapters
+                con.print("[yellow]M4B file already has chapters. Options:[/]")
+                con.print("  1. Use existing chapters (fast, recommended)")
+                con.print("  2. Re-detect chapters with ML (slow, may find different breaks)")
+
+                choice = input("\nChoice [1/2] (default: 1): ").strip() or "1"
+
+                if choice == "1":
+                    # Use existing chapters - skip to file splitting
+                    con.rule("[cyan]Using Existing M4B Chapters[/cyan]")
+                    print("\n")
+                else:
+                    # Continue with ML detection
+                    con.print("[yellow]Continuing with ML chapter detection...[/]")
+                    print("\n")
+                    timecodes = None  # Reset to trigger detection
+            else:
+                con.print("[yellow]No embedded chapters found - will use ML detection[/]")
+                print("\n")
+                timecodes = None
+        except ImportError:
+            con.print("[yellow]m4b_support module not found - using ML detection[/]")
+            print("\n")
+            timecodes = None
+        except Exception as e:
+            con.print(f"[yellow]Could not extract M4B chapters: {e}[/]")
+            con.print("[yellow]Falling back to ML detection[/]")
+            print("\n")
+            timecodes = None
+    else:
+        timecodes = None
+
+    # Extract metadata from input file (skip if already extracted from M4B)
+    if file_ext in ['.m4b', '.m4a'] and 'parsed_metadata' in locals() and parsed_metadata:
+        # Already extracted from M4B
+        con.rule("[cyan]Using M4B Metadata[/cyan]")
+        print("\n")
+    else:
+        con.rule("[cyan]Extracting metadata[/cyan]")
+        print("\n")
+        parsed_metadata = extract_metadata(audiobook_file, ffmpeg)
 
     # Combine the dicts, overwriting existing keys with user values if passed
     if parsed_metadata and in_metadata:
@@ -1184,47 +1254,56 @@ def main():
         print("\n")
         download_model(model_name)
 
-    # Generate timecodes from mp3 file
-    con.rule("[cyan]Generating Timecodes[/cyan]")
-    print("\n")
+    # Generate timecodes from audio file (skip if already have from M4B)
+    if 'timecodes' not in locals() or timecodes is None:
+        con.rule("[cyan]Generating Timecodes[/cyan]")
+        print("\n")
 
-    if model_type == 'small':
-        message = "[magenta]Sit tight, this might take a while[/magenta]..."
+        if model_type == 'small':
+            message = "[magenta]Sit tight, this might take a while[/magenta]..."
+        else:
+            message = "[magenta]Sit tight, this might take a [u]long[/u] while[/magenta]..."
+
+        with con.status(message, spinner='pong'):
+            timecodes_file = generate_timecodes(audiobook_file, lang, model_type)
+
+        # If cue file exists, read timecodes from file
+        if cue_file and cue_file.exists():
+            con.rule("[cyan]Reading Cue File[/cyan]")
+            print("\n")
+
+            if (cue_timecodes := read_cue_file(cue_file)) is not None:
+                con.print("[bold green]SUCCESS![/] Timecodes parsed from cue file")
+                timecodes = cue_timecodes
+            else:
+                timecodes = None
+        else:
+            timecodes = None
+
+        # If timecodes not parsed from cue file, parse from srt
+        if not timecodes:
+            # Open file and parse timecodes
+            try:
+                with open(timecodes_file, 'r', encoding='utf-8') as fp:
+                    file_lines = fp.readlines()
+            except (OSError, UnicodeDecodeError) as e:
+                con.print(f"[bold red]ERROR:[/] Failed to read timecodes file: {e}")
+                sys.exit(10)
+
+            con.rule("[cyan]Parsing Timecodes[/cyan]")
+            print("\n")
+
+            timecodes = parse_timecodes(file_lines, lang)
+            con.print("[bold green]SUCCESS![/] Timecodes parsed")
+
+        # Print timecodes table
+        print("\n")
+        print_table(timecodes)
+        print("\n")
     else:
-        message = "[magenta]Sit tight, this might take a [u]long[/u] while[/magenta]..."
-
-    with con.status(message, spinner='pong'):
-        timecodes_file = generate_timecodes(audiobook_file, lang, model_type)
-
-    # If cue file exists, read timecodes from file
-    timecodes = None
-    if cue_file and cue_file.exists():
-        con.rule("[cyan]Reading Cue File[/cyan]")
+        # Already have timecodes from M4B
+        con.print("[cyan]Using timecodes from M4B file[/cyan]")
         print("\n")
-
-        if (timecodes := read_cue_file(cue_file)) is not None:
-            con.print("[bold green]SUCCESS![/] Timecodes parsed from cue file")
-
-    # If timecodes not parsed from cue file, parse from srt
-    if not timecodes:
-        # Open file and parse timecodes
-        try:
-            with open(timecodes_file, 'r', encoding='utf-8') as fp:
-                file_lines = fp.readlines()
-        except (OSError, UnicodeDecodeError) as e:
-            con.print(f"[bold red]ERROR:[/] Failed to read timecodes file: {e}")
-            sys.exit(10)
-
-        con.rule("[cyan]Parsing Timecodes[/cyan]")
-        print("\n")
-
-        timecodes = parse_timecodes(file_lines, lang)
-        con.print("[bold green]SUCCESS![/] Timecodes parsed")
-
-    # Print timecodes table
-    print("\n")
-    print_table(timecodes)
-    print("\n")
 
     # Generate cue file if selected and one doesn't already exist
     con.rule("[cyan]Writing Cue File[/cyan]")
