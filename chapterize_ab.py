@@ -733,15 +733,24 @@ def split_file(audiobook_path: Path,
                metadata: dict,
                cover_art: Optional[Path],
                ffmpeg: str) -> None:
-    """Splits a single .mp3 file into chapterized segments.
+    """Splits a single audiobook file into chapterized segments.
 
-    :param audiobook_path: Path to original .mp3 audiobook
+    Supports MP3, M4B, and M4A formats. Output format matches input format
+    to preserve codec quality with -c copy.
+
+    :param audiobook_path: Path to original audiobook file
     :param timecodes: List of start/end markers for each chapter
     :param metadata: File metadata passed via CLI and/or parsed from audiobook file
     :param cover_art: Optional path to cover art
     :param ffmpeg: Path to ffmpeg executable
     """
     file_stem = audiobook_path.stem
+    file_ext = audiobook_path.suffix.lower()
+
+    # Determine output extension (must match input codec)
+    # M4B/M4A use AAC codec, MP3 uses MP3 codec
+    output_ext = file_ext if file_ext in ['.m4b', '.m4a'] else '.mp3'
+
     # Set the log path for output
     log_path = audiobook_path.parent / 'ffmpeg_log.txt'
 
@@ -758,12 +767,15 @@ def split_file(audiobook_path: Path,
 
     command = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'info', '-i', str(audiobook_path)]
 
+    # ID3v2 is only for MP3 files, not M4B/M4A
     if cover_art:
-        command.extend(['-i', str(cover_art), '-id3v2_version', '3', '-metadata:s:v',
-                        'comment="Cover (front)"'])
+        command.extend(['-i', str(cover_art)])
+        if output_ext == '.mp3':
+            command.extend(['-id3v2_version', '3', '-metadata:s:v', 'comment="Cover (front)"'])
         stream = ['-map', '0:0', '-map', '1:0', '-c', 'copy']
     else:
-        command.extend(['-id3v2_version', '3'])
+        if output_ext == '.mp3':
+            command.extend(['-id3v2_version', '3'])
         stream = ['-c', 'copy']
 
     # Handle metadata strings if they exist
@@ -798,9 +810,9 @@ def split_file(audiobook_path: Path,
                 command_copy[7:7] = ['-to', times['end']]
 
             if 'chapter_type' in times:
-                file_path = audiobook_path.parent / f"{file_stem} {counter_str} - {times['chapter_type']}.mp3"
+                file_path = audiobook_path.parent / f"{file_stem} {counter_str} - {times['chapter_type']}{output_ext}"
             else:
-                file_path = audiobook_path.parent / f"{file_stem} - {counter_str}.mp3"
+                file_path = audiobook_path.parent / f"{file_stem} - {counter_str}{output_ext}"
 
             track_num = ['-metadata', f"track={counter}/{len(timecodes)}"]
             command_copy.extend([*stream, *track_num, '-metadata', f"title={times['chapter_type']}",
@@ -1008,12 +1020,15 @@ def verify_count(audiobook_path: Path, timecodes: list[dict]) -> None:
     """Verify that the expected number of files were generated.
 
     Compares the number of files split from the audiobook to ensure it matches the length of the generated
-    timecodes.
+    timecodes. Checks for files with the same extension as the input file.
 
     :param audiobook_path: Path to audiobook file
     :param timecodes: List of dictionaries containing chapter type, start, and end times
     """
-    file_count = sum(1 for x in audiobook_path.parent.glob('*.mp3') if x.stem != audiobook_path.stem)
+    # Count files with same extension as input (excluding the original file)
+    file_ext = audiobook_path.suffix.lower()
+    pattern = f'*{file_ext}'
+    file_count = sum(1 for x in audiobook_path.parent.glob(pattern) if x.stem != audiobook_path.stem)
     expected = len(timecodes)
 
     if file_count >= expected:
