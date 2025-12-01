@@ -95,7 +95,30 @@ def detect_by_whisper(audiobook_path: Path,
             "Install with: pip install faster-whisper"
         )
 
-    print(f"[faster-whisper] Loading model: {model_size}")
+    # For M4B files, check for existing chapters first!
+    if audiobook_path.suffix.lower() in ['.m4b', '.m4a']:
+        print(f"[faster-whisper] Detected M4B/M4A file: {audiobook_path.name}")
+        print("[faster-whisper] Checking for existing chapters first...")
+
+        try:
+            from m4b_support import get_m4b_chapters
+            existing_chapters = get_m4b_chapters(audiobook_path)
+
+            if existing_chapters:
+                print(f"[faster-whisper] Found {len(existing_chapters)} existing chapters!")
+                print("[faster-whisper] TIP: Use the main script for instant extraction:")
+                print(f"  python chapterize_ab.py \"{audiobook_path}\"")
+
+                choice = input("\nUse existing chapters? [Y/n]: ").strip().lower()
+                if choice != 'n':
+                    return existing_chapters
+                else:
+                    print("[faster-whisper] Continuing with ML detection...")
+        except (ImportError, Exception) as e:
+            print(f"[faster-whisper] Could not check for M4B chapters: {e}")
+            print("[faster-whisper] Proceeding with transcription...")
+
+    print(f"\n[faster-whisper] Loading model: {model_size}")
     model = WhisperModel(
         model_size,
         device=device,
@@ -103,7 +126,8 @@ def detect_by_whisper(audiobook_path: Path,
     )
 
     print(f"[faster-whisper] Transcribing: {audiobook_path.name}")
-    print("This may take a while for long audiobooks...")
+    print("[faster-whisper] This may take a while - processing audio...")
+    print("[faster-whisper] Note: Progress updates will appear as segments are processed\n")
 
     segments, info = model.transcribe(
         str(audiobook_path),
@@ -113,7 +137,7 @@ def detect_by_whisper(audiobook_path: Path,
         vad_parameters=dict(min_silence_duration_ms=500)
     )
 
-    print(f"[faster-whisper] Detected language: {info.language} "
+    print(f"\n[faster-whisper] Detected language: {info.language} "
           f"(probability: {info.language_probability:.2f})")
 
     # Extract chapter markers
