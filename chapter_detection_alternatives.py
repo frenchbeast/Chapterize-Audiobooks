@@ -126,6 +126,17 @@ def detect_by_whisper(audiobook_path: Path,
     )
 
     print(f"[faster-whisper] Transcribing: {audiobook_path.name}")
+
+    # Check file size to determine if we should use VAD
+    # VAD can crash on very large files due to memory usage
+    file_size_mb = audiobook_path.stat().st_size / (1024 * 1024)
+    use_vad = file_size_mb < 500  # Only use VAD for files < 500MB
+
+    if use_vad:
+        print("[faster-whisper] Using Voice Activity Detection to skip silence...")
+    else:
+        print(f"[faster-whisper] Large file ({file_size_mb:.0f}MB) - VAD disabled to prevent memory issues")
+
     print("[faster-whisper] This may take a while - processing audio...")
     print("[faster-whisper] Note: Progress updates will appear as segments are processed\n")
 
@@ -133,8 +144,8 @@ def detect_by_whisper(audiobook_path: Path,
         str(audiobook_path),
         language=language,
         beam_size=5,
-        vad_filter=True,  # Skip silence automatically!
-        vad_parameters=dict(min_silence_duration_ms=500)
+        vad_filter=use_vad,
+        vad_parameters=dict(min_silence_duration_ms=500) if use_vad else None
     )
 
     print(f"\n[faster-whisper] Detected language: {info.language} "
