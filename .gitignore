@@ -1,4 +1,41 @@
+# Virtual environment
 venv
+.venv
+env
+
+# IDE
 .idea
-test*.py
+.vscode
+
+# Python
 **/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+*.cover
+
+# Exclude test files, but keep our main test file
+test*.py
+!test_chapterize_ab.py
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+*.mp3
+*.wav
+*.srt
+*.cue
+*.jpg
+*.jpeg
+*.png
+ffmpeg_log.txt
+metadata.txt
