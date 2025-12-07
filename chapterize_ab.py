@@ -4,14 +4,21 @@ import re
 import subprocess
 import argparse
 import sys
-from typing import Optional, TypeVar
+import time
+from typing import Optional
 from pathlib import Path
-from shutil import (
-    unpack_archive,
-    copytree,
-    rmtree,
-    which
-)
+from shutil import unpack_archive, copytree, rmtree, which
+from datetime import datetime, timedelta
+from dataclasses import dataclass
+
+# Handle tomli/tomllib for different Python versions
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        tomllib = None
 
 from rich.console import Console
 from rich.pretty import Pretty
@@ -35,35 +42,126 @@ from model.models import (
     get_language_features
 )
 
+# Optional imports for alternative detection methods
+try:
+    from chapter_detection_alternatives import (
+        detect_by_silence,
+        detect_by_whisper,
+        detect_hybrid
+    )
+    ALTERNATIVES_AVAILABLE = True
+except ImportError:
+    ALTERNATIVES_AVAILABLE = False
+
 '''
-    Globals
+    Constants
 '''
 
-__version__ = '0.6.0'
+__version__ = '0.7.0'
 __author__ = 'patrickenfuego'
 
-PathLike = TypeVar('PathLike', Path, str, None)
-vosk_url = "https://alphacephei.com/vosk/models"
-vosk_link = f"[link={vosk_url}]this link[/link]"
-# Default to ffmpeg in PATH
-ffmpeg = 'ffmpeg'
+# Audio processing constants
+SAMPLE_RATE = 16000
+AUDIO_CHANNELS = 1
+
+# Download chunk sizes (in bytes)
+CHUNK_SIZE_SMALL = 50
+CHUNK_SIZE_LARGE = 300
+
+# File size thresholds
+MIN_METADATA_SIZE = 10
+MIN_COVER_ART_SIZE = 10
+
+# URLs
+VOSK_URL = "https://alphacephei.com/vosk/models"
+vosk_link = f"[link={VOSK_URL}]this link[/link]"
+
+# Console
 con = Console()
+
+
+'''
+    Configuration Management
+'''
+
+
+@dataclass
+class Config:
+    """Configuration settings for the application."""
+    default_language: str = 'en-us'
+    default_model: str = 'small'
+    ffmpeg_path: str = 'ffmpeg'
+    generate_cue_file: bool = False
+    cue_path: str = ''
+
+    def validate(self) -> list[str]:
+        """Validate configuration values.
+
+        :return: List of validation error messages
+        """
+        errors = []
+
+        if self.default_model not in ('small', 'large'):
+            errors.append(
+                f"Invalid model size in config file: '{self.default_model}'. "
+                "Must be 'small' or 'large'."
+            )
+
+        if self.default_language not in model_languages.values():
+            errors.append(
+                f"Invalid language in config file: '{self.default_language}'"
+            )
+
+        if self.generate_cue_file and not isinstance(self.generate_cue_file, bool):
+            errors.append("generate_cue_file must be a boolean value")
+
+        return errors
+
 
 '''
     Utility Function Declarations
 '''
 
 
-def path_exists(path: PathLike) -> Path:
+def format_elapsed_time(seconds: float) -> str:
+    """Format elapsed time in seconds to a readable string.
+
+    :param seconds: Elapsed time in seconds
+    :return: Formatted string (e.g., "2h 15m 30s" or "45m 12s" or "23s")
+    """
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        mins = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{mins}m {secs}s"
+    else:
+        hours = int(seconds // 3600)
+        mins = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        return f"{hours}h {mins}m {secs}s"
+
+
+def path_exists(path: Path | str) -> Path:
     """Utility function to check if a path exists. Used by argparse.
 
     :param path: File path to verify
     :return: The tested file path if it exists
+    :raises argparse.ArgumentTypeError: If the path does not exist
     """
-    if Path(path).exists():
-        return Path(path)
+    path_obj = Path(path)
+    if path_obj.exists():
+        return path_obj
     else:
-        raise FileNotFoundError(f"The path: <{path}> does not exist")
+        # Use ArgumentTypeError for better argparse integration
+        raise argparse.ArgumentTypeError(
+            f"\n\n"
+            f"  File not found: {path}\n\n"
+            f"  Please check:\n"
+            f"    - The file path is correct\n"
+            f"    - The file exists at the specified location\n"
+            f"    - You have permission to access the file\n"
+        )
 
 
 def verify_language(language: str) -> str:
@@ -75,28 +173,24 @@ def verify_language(language: str) -> str:
     :param language: Model language
     :return: The language string if it is a supported language
     """
+    if not language:
+        con.print("[bold red]ERROR:[/] Language option appears to be empty")
+        sys.exit(1)
 
-    found = False
     code = ''
 
     if language.lower() in model_languages.values():
         code = language.lower()
-        found = True
-    if not found and language.title() in model_languages.keys():
+    elif language.title() in model_languages.keys():
         code = model_languages[language.title()]
-        found = True
-
-    if not language:
-        con.print("[bold red]ERROR:[/] Language option appears to be empty")
-        sys.exit(1)
-    elif not found:
-        con.print("[bold red]ERROR:[/] Invalid language or langauge code entered. Possible options:")
+    else:
+        con.print("[bold red]ERROR:[/] Invalid language or language code entered. Possible options:")
         print("\n")
         con.print(Panel(Pretty(model_languages), title="Supported Languages & Codes"))
         print("\n")
         sys.exit(2)
-    else:
-        return code
+
+    return code
 
 
 def verify_download(language: str, model_type: str) -> str:
@@ -109,69 +203,144 @@ def verify_download(language: str, model_type: str) -> str:
     :param model_type: Type of model (small or large).
     :return: String name of the model file to download if supported.
     """
-
     lang_code = verify_language(language)
     name = ''
-    found = False
     other = 'small' if model_type == 'large' else 'large'
 
-    if model_type == 'small':
-        for line in models_small:
-            if lang_code in line:
-                name = line
-                break
-    elif model_type == 'large':
-        for line in models_large:
-            if lang_code in line:
-                name = line
-                break
+    # Search for the model in the appropriate list
+    model_list = models_small if model_type == 'small' else models_large
+    for line in model_list:
+        if lang_code in line:
+            name = line
+            break
 
     # If the specified model wasn't found, check for a different size
-    if not name and model_type == 'small':
-        for line in models_large:
-            if lang_code in line:
-                found = True
-                break
-    elif not name and model_type == 'large':
-        for line in models_small:
-            if lang_code in line:
-                found = True
-                break
+    if not name:
+        alt_list = models_large if model_type == 'small' else models_small
+        found_alt = any(lang_code in line for line in alt_list)
 
-    if not name and found:
-        con.print(
-            f"[bold yellow]WARNING:[/] The selected model cannot be downloaded for '{language}' "
-            f"in the specified size '{model_type}'. However, a '{other}' model was found. "
-            f"You can re-run the script and choose {other}, or attempt to "
-            f"download a different model manually from {vosk_link}."
-        )
-        sys.exit(3)
-    elif not name:
-        con.print(
-            f"[bold red]ERROR:[/] The selected model cannot be downloaded for '{language}' "
-            f"in size {model_type}. You can try and download a different model manually "
-            f"from {vosk_link}."
-        )
-        sys.exit(33)
+        if found_alt:
+            con.print(
+                f"[bold yellow]WARNING:[/] The selected model cannot be downloaded for '{language}' "
+                f"in the specified size '{model_type}'. However, a '{other}' model was found. "
+                f"You can re-run the script and choose {other}, or attempt to "
+                f"download a different model manually from {vosk_link}."
+            )
+            sys.exit(3)
+        else:
+            con.print(
+                f"[bold red]ERROR:[/] The selected model cannot be downloaded for '{language}' "
+                f"in size {model_type}. You can try and download a different model manually "
+                f"from {vosk_link}."
+            )
+            sys.exit(33)
 
     return name
 
 
-def parse_config() -> dict:
-    """Parses the toml config file.
+def parse_config() -> Config:
+    """Parses the TOML config file.
 
-    :return: A dictionary containing the config file contents.
+    :return: A Config object containing the configuration settings.
+    :raises SystemExit: If config file doesn't exist or can't be parsed
     """
+    config_path = Path.cwd() / 'defaults.toml'
 
-    if (config := Path.cwd().joinpath('defaults.toml')).exists():
-        with open(config, 'r') as fp:
-            lines = fp.readlines()
-        defaults = {k: v for k, v in [l.strip("\n").replace("'", "").split('=') for l in lines if '#' not in l]}
-        return defaults
-    else:
-        con.print("[bold red]ERROR:[/] Could not locate [blue]defaults.toml[/] file. Did you move or delete it?")
+    if not config_path.exists():
+        con.print(
+            "[bold red]ERROR:[/] Could not locate [blue]defaults.toml[/] file. "
+            "Did you move or delete it?"
+        )
         print("\n")
-        return {}
+        return Config()
+
+    # Use proper TOML library
+    if tomllib is None:
+        con.print(
+            "[bold yellow]WARNING:[/] tomli library not available. "
+            "Install with: pip install tomli"
+        )
+        con.print("[yellow]Falling back to basic parsing[/]")
+
+        # Fallback to simple parsing
+        try:
+            with open(config_path, 'r') as fp:
+                lines = fp.readlines()
+            defaults = {}
+            for line in lines:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    defaults[key.strip()] = value.strip().strip("'\"")
+
+            return Config(
+                default_language=defaults.get('default_language', 'en-us'),
+                default_model=defaults.get('default_model', 'small'),
+                ffmpeg_path=defaults.get('ffmpeg_path', 'ffmpeg'),
+                generate_cue_file=defaults.get('generate_cue_file', 'False') == 'True',
+                cue_path=defaults.get('cue_path', '')
+            )
+        except (ValueError, KeyError) as e:
+            con.print(f"[bold red]ERROR:[/] Failed to parse config file: {e}")
+            return Config()
+
+    # Use proper TOML parsing
+    try:
+        with open(config_path, 'rb') as fp:
+            data = tomllib.load(fp)
+
+        config = Config(
+            default_language=data.get('default_language', 'en-us'),
+            default_model=data.get('default_model', 'small'),
+            ffmpeg_path=data.get('ffmpeg_path', 'ffmpeg'),
+            generate_cue_file=data.get('generate_cue_file', False),
+            cue_path=data.get('cue_path', '')
+        )
+
+        # Validate configuration
+        if errors := config.validate():
+            con.print("[bold yellow]WARNING:[/] Configuration validation errors:")
+            for error in errors:
+                con.print(f"  - {error}")
+            con.print("[yellow]Using default values for invalid settings[/]")
+            # Reset invalid values to defaults
+            if config.default_model not in ('small', 'large'):
+                config.default_model = 'small'
+
+        return config
+
+    except (tomllib.TOMLDecodeError, OSError) as e:
+        con.print(f"[bold red]ERROR:[/] Failed to parse TOML config: {e}")
+        return Config()
+
+
+def get_ffmpeg_path(config: Config) -> str:
+    """Determine the ffmpeg executable path.
+
+    :param config: Configuration object
+    :return: Path to ffmpeg executable
+    :raises SystemExit: If ffmpeg cannot be found
+    """
+    # Try config path first
+    if config.ffmpeg_path and config.ffmpeg_path != 'ffmpeg':
+        if Path(config.ffmpeg_path).exists():
+            return str(config.ffmpeg_path)
+        else:
+            con.print(
+                "[yellow]NOTE:[/] ffmpeg path in [blue]defaults.toml[/] does not exist"
+            )
+
+    # Try system PATH
+    if ffmpeg_path := which('ffmpeg'):
+        if config.ffmpeg_path and config.ffmpeg_path != 'ffmpeg':
+            con.print(
+                f"[yellow]NOTE:[/] Found ffmpeg in system PATH: [green]{ffmpeg_path}[/]"
+            )
+        return 'ffmpeg'
+
+    # Not found
+    con.print("[bold red]CRITICAL:[/] ffmpeg was not found in config file or system PATH. Aborting")
+    sys.exit(1)
 
 
 '''
@@ -183,15 +352,11 @@ def parse_args():
     """
     Parses command line arguments.
 
-    :return: A tuple containing the audiobook path, metadata file path, and user-defined metadata values
+    :return: A tuple containing the audiobook path, metadata, language, model info, and cue file path
     """
-
-    model_name = ''
-    download = ''
-
     parser = argparse.ArgumentParser(
         description='''
-        Splits a single monolithic mp3 audiobook file into multiple chapter files using Machine Learning. 
+        Splits a single monolithic mp3 audiobook file into multiple chapter files using Machine Learning.
         Metadata and cover art are also extracted from the source file, but any user supplied values
         automatically take precedence when conflicts arise.
         '''
@@ -232,9 +397,36 @@ def parse_args():
                         help='Generate a cue file in the audiobook directory for editing chapter markers. Can also be set in defaults.toml. Default disabled')
     parser.add_argument('--cue_path', '-cp', nargs='?', default=None, metavar='CUE_PATH', type=path_exists,
                         help='Path to cue file in non-default location (i.e., not in the audiobook directory) containing chapter timecodes. Can also be set in defaults.toml, which has lesser precedence than this argument')
+    parser.add_argument('--use-existing-chapters', '-uec', action='store_true', dest='use_existing',
+                        help='For M4B files: automatically use existing embedded chapters without prompting')
+    parser.add_argument('--detection-method', '-dm2', dest='detection_method',
+                        choices=['auto', 'vosk', 'whisper', 'hybrid', 'silence'],
+                        default='auto',
+                        help='Chapter detection method. "auto" intelligently chooses the best method: '
+                             'M4B embedded chapters > faster-whisper > Vosk fallback. '
+                             'Manual options: vosk (slow, default ML), whisper (5-10x faster), '
+                             'hybrid (silence + selective transcription), silence (fastest, no ML)')
+    parser.add_argument('--output-format', '-of', dest='output_format',
+                        choices=['auto', 'mp3', 'm4b'],
+                        default='auto',
+                        help='Output file format. "auto" matches input format (M4B→M4B, MP3→MP3). '
+                             'Use "mp3" to convert M4B to MP3 for better compatibility (e.g., Apple Music). '
+                             'Note: Converting to MP3 requires re-encoding (slower, slight quality loss). '
+                             'Default: auto')
 
     args = parser.parse_args()
     config = parse_config()
+
+    # Check if audiobook file was provided
+    if not args.audiobook:
+        con.print("\n[bold red]ERROR:[/] No audiobook file specified\n")
+        con.print("[yellow]Usage:[/]")
+        con.print("  python chapterize_ab.py <audiobook_file> [options]\n")
+        con.print("[yellow]Example:[/]")
+        con.print("  python chapterize_ab.py audiobook.mp3 --title \"My Book\"\n")
+        con.print("[yellow]Supported formats:[/] .mp3, .m4b, .m4a\n")
+        parser.print_help()
+        sys.exit(1)
 
     if args.list_languages:
         con.print(Panel(Pretty(model_languages), title="Supported Languages & Codes"))
@@ -247,6 +439,9 @@ def parse_args():
         print("\n")
         sys.exit(0)
 
+    model_name = ''
+    download = ''
+
     if 'download' in args:
         if args.lang == 'en-us':
             con.print(
@@ -257,7 +452,6 @@ def parse_args():
 
         download = 'small' if args.download not in ['small', 'large'] else args.download
         model_name = verify_download(args.lang, download)
-
 
     # Set ID3 metadata fields based on passed args
     meta_fields = {'cover_art': args.cover_art if args.cover_art else None,
@@ -275,23 +469,13 @@ def parse_args():
     if args.narrator:
         meta_fields['narrator'] = args.narrator
 
-    # If the user chooses to download a model, and it was verified
+    # Determine model type
     if download:
         model_type = download
-    # If the user passes a value via CLI (overrides config)
     elif 'model_type' in args:
         model_type = args.model_type
-    # If the config file contains a value
-    elif config['default_model']:
-        # Verify valid model size
-        if (model_type := config['default_model']) not in ('small', 'large'):
-            con.print(
-                f"[bold red]ERROR:[/] Invalid model size in config file: '{model_type}'. "
-                "Defaulting to 'small'."
-            )
-            model_type = 'small'
     else:
-        model_type = 'small'
+        model_type = config.default_model
 
     # Check if cue file write is enabled, if custom path was passed, or if cue already exists
     if args.cue_path:
@@ -299,23 +483,22 @@ def parse_args():
         con.print(
             f"[bright_magenta]Cue file <<[/] [blue]custom path[/]: Reading cue file from [green]{cue_file}[/]"
         )
-    elif config['cue_path']:
-        if not Path(config['cue_path']).exists():
+    elif config.cue_path:
+        if not Path(config.cue_path).exists():
             con.print(
                 "[bold yellow]WARNING:[/] Cue file in [blue]defaults.toml[/] does not exist and will be skipped"
             )
             cue_file = None
         else:
-            cue_file = Path(config['cue_path'])
+            cue_file = Path(config.cue_path)
             con.print(
                 f"[bright_magenta]Cue file <<[/] [blue]default.toml[/]: Reading cue file from [green]{cue_file}[/]"
             )
     elif (
             args.write_cue or
-            config['generate_cue_file'] == 'True' or
+            config.generate_cue_file or
             args.audiobook.with_suffix('.cue').exists()
         ):
-
         cue_file = args.audiobook.with_suffix('.cue')
         method = ('Writing', 'to') if not cue_file.exists() else ('Reading', 'from')
         con.print(f"[bright_magenta]Cue file[/]: {method[0]} cue file {method[1]} [green]{cue_file}[/]")
@@ -325,36 +508,16 @@ def parse_args():
     if cue_file:
         print("\n")
 
-    # If the user passes a language via CLI
+    # Determine language
     if 'lang' in args:
         language = args.lang
-    # Check for a value in the config file
-    elif 'default_language' in config:
-        language = verify_language(config['default_language'])
     else:
-        language = 'en-us'
+        language = verify_language(config.default_language)
 
-    # Set ffmpeg from system PATH or config file
-    global ffmpeg
-    if config['ffmpeg_path'] and config['ffmpeg_path'] != 'ffmpeg':
-        if Path(config['ffmpeg_path']).exists():
-            ffmpeg = Path(config['ffmpeg_path'])
-        elif (ffmpeg := which('ffmpeg')) is not None:
-            con.print(
-                "[yellow]NOTE:[/] ffmpeg path in [blue]defaults.toml[/] does not exist, but "
-                f"was found in system PATH: [green]{ffmpeg}[/]"
-            )
-            ffmpeg = 'ffmpeg'
-        else:
-            con.print("[bold red]CRITICAL:[/] ffmpeg path in [blue]defaults.toml[/] does not exist")
-            sys.exit(1)
-    elif (ffmpeg := which('ffmpeg')) is not None:
-        ffmpeg = 'ffmpeg'
-    else:
-        con.print("[bold red]CRITICAL:[/] ffmpeg was not found in config file or system PATH. Aborting")
-        sys.exit(1)
+    # Get ffmpeg path
+    ffmpeg = get_ffmpeg_path(config)
 
-    return args.audiobook, meta_fields, language, model_name, model_type, cue_file
+    return args.audiobook, meta_fields, language, model_name, model_type, cue_file, ffmpeg, args.use_existing, args.detection_method, args.output_format
 
 
 def build_progress(bar_type: str) -> Progress:
@@ -362,8 +525,8 @@ def build_progress(bar_type: str) -> Progress:
 
     :param bar_type: Type of progress bar.
     :return: a Progress object
+    :raises ValueError: If bar_type is unknown
     """
-
     text_column = TextColumn(
         "[bold blue]{task.fields[verb]}[/] [bold magenta]{task.fields[noun]}",
         justify="right"
@@ -388,7 +551,7 @@ def build_progress(bar_type: str) -> Progress:
             DownloadColumn()
         )
     else:
-        raise ValueError("Unknown progress bar type")
+        raise ValueError(f"Unknown progress bar type: {bar_type}")
 
     return progress
 
@@ -397,9 +560,7 @@ def print_table(list_dicts: list[dict]) -> None:
     """Formats a list of dictionaries into a table. Currently only used for timecodes.
 
     :param list_dicts: List of dictionaries to format
-    :return: None
     """
-
     table = Table(
         title='[bold magenta]Parsed Timecodes for Chapters[/]',
         caption='[red]EOF[/] = End of File'
@@ -417,95 +578,105 @@ def print_table(list_dicts: list[dict]) -> None:
 
     if len(merge_rows[-1]) != 3:
         merge_rows[-1].append('EOF')
-    for i, row in enumerate(merge_rows):
+    for row in merge_rows:
         table.add_row(f"[green]{str(row[0])}", f"[red]{str(row[2])}", f"[bright_blue]{str(row[1])}")
 
     con.print(table)
 
 
-def extract_metadata(audiobook_path: PathLike) -> dict:
+def extract_metadata(audiobook_path: Path, ffmpeg: str) -> dict:
     """Extracts existing metadata from the input file.
 
     :param audiobook_path: Path to the input audiobook file
+    :param ffmpeg: Path to ffmpeg executable
     :return: A dictionary containing metadata values
     """
+    metadata_file = audiobook_path.parent / 'metadata.txt'
 
-    metadata_file = audiobook_path.parent.joinpath('metadata.txt')
     # Extract metadata to file using ffmpeg
-    subprocess.run([str(ffmpeg), '-y', '-loglevel', 'quiet', '-i', audiobook_path,
-                    '-f', 'ffmetadata', f'{metadata_file}'])
+    try:
+        subprocess.run(
+            [ffmpeg, '-y', '-loglevel', 'quiet', '-i', str(audiobook_path),
+             '-f', 'ffmetadata', str(metadata_file)],
+            check=True,
+            capture_output=True
+        )
+    except subprocess.CalledProcessError as e:
+        con.print(f"[bold yellow]WARNING:[/] Failed to extract metadata: {e}")
+        return {}
 
     meta_dict = {}
     # If path exists and has some content
-    if path_exists(metadata_file) and Path(metadata_file).stat().st_size > 10:
-        con.print("[bold green]SUCCESS![/] Metadata extraction complete")
-        with open(metadata_file, 'r') as fp:
-            meta_lines = fp.readlines()
+    try:
+        if metadata_file.exists() and metadata_file.stat().st_size > MIN_METADATA_SIZE:
+            con.print("[bold green]SUCCESS![/] Metadata extraction complete")
+            with open(metadata_file, 'r', encoding='utf-8', errors='ignore') as fp:
+                meta_lines = fp.readlines()
 
-        for line in meta_lines:
-            line_split = line.split('=')
-            if len(line_split) == 2:
-                key, value = [x.strip('\n') for x in line_split]
-                if key in ['title', 'genre', 'album_artist', 'artist', 'album', 'year']:
-                    meta_dict[key] = value
-    else:
-        con.print("[bold yellow]WARNING:[/] Failed to parse metadata file, or none was found")
-    # Delete the metadata file once done
-    metadata_file.unlink()
+            for line in meta_lines:
+                if '=' not in line:
+                    continue
+                parts = line.split('=', 1)
+                if len(parts) == 2:
+                    key, value = [x.strip() for x in parts]
+                    if key in ['title', 'genre', 'album_artist', 'artist', 'album', 'year']:
+                        meta_dict[key] = value
+        else:
+            con.print("[bold yellow]WARNING:[/] Failed to parse metadata file, or none was found")
+    except (OSError, UnicodeDecodeError) as e:
+        con.print(f"[bold yellow]WARNING:[/] Error reading metadata file: {e}")
+    finally:
+        # Delete the metadata file once done
+        if metadata_file.exists():
+            try:
+                metadata_file.unlink()
+            except OSError:
+                pass
 
     return meta_dict
 
 
-def extract_coverart(audiobook_path: PathLike) -> Path | None:
-    """Extract coverart file from audiobook if present.
+def extract_coverart(audiobook_path: Path, ffmpeg: str) -> Optional[Path]:
+    """Extract cover art file from audiobook if present.
 
     :param audiobook_path: Input audiobook file
+    :param ffmpeg: Path to ffmpeg executable
     :return: Path to cover art jpg file if found, otherwise None
     """
+    cover_art = audiobook_path.with_suffix('.jpg')
 
-    covert_art = audiobook_path.with_suffix('.jpg')
-    subprocess.run([str(ffmpeg), '-y', '-loglevel', 'quiet', '-i',
-                    audiobook_path, '-an', '-c:v', 'copy', covert_art])
-    if Path(covert_art).exists() and Path(covert_art).stat().st_size > 10:
-        con.print("[bold green]SUCCESS![/] Cover art extracted")
-        print("\n")
-        return covert_art
-    else:
+    try:
+        subprocess.run(
+            [ffmpeg, '-y', '-loglevel', 'quiet', '-i', str(audiobook_path),
+             '-an', '-c:v', 'copy', str(cover_art)],
+            check=True,
+            capture_output=True
+        )
+
+        if cover_art.exists() and cover_art.stat().st_size > MIN_COVER_ART_SIZE:
+            con.print("[bold green]SUCCESS![/] Cover art extracted")
+            print("\n")
+            return cover_art
+        else:
+            con.print("[bold yellow]WARNING:[/] Failed to extract cover art, or none was found")
+            print("\n")
+            return None
+
+    except subprocess.CalledProcessError:
         con.print("[bold yellow]WARNING:[/] Failed to extract cover art, or none was found")
         print("\n")
         return None
-
-
-def convert_to_wav(audiobook_path: PathLike) -> Path:
-    """
-    Convert input file to lossless wav format. Currently unused, but might be useful for
-    legacy versions of vosk.
-
-    :param audiobook_path: Input .mp3 file to convert
-    :return: Path to .wav file
-    """
-
-    wav_file = audiobook_path.with_suffix('.wav')
-    con.print("[magenta]Converting file to wav...[/]")
-    result = subprocess.run([
-        str(ffmpeg), '-i', audiobook_path, '-ar', '16000', '-ac', '1', wav_file
-    ])
-
-    print(f"Subprocess result: {result.returncode}")
-
-    return wav_file
 
 
 def download_model(name: str) -> None:
     """Downloads the specified language model from vosk (if available).
 
     :param name: Name of the model found on the vosk website
-    :return: None (void)
+    :raises SystemExit: If download fails or requests library is unavailable
     """
-
     try:
         import requests
-        from requests.exceptions import ConnectionError as ReqConnectionError
+        from requests.exceptions import ConnectionError as ReqConnectionError, RequestException
     except ImportError:
         con.print(
             "[bold red]CRITICAL:[/] requests library is not available, and is required for "
@@ -513,8 +684,8 @@ def download_model(name: str) -> None:
         )
         sys.exit(18)
 
-    full = f'{vosk_url}/{name}.zip'
-    out_base = Path('__file__').parent.absolute() / 'model'
+    full_url = f'{VOSK_URL}/{name}.zip'
+    out_base = Path(__file__).parent.absolute() / 'model'
     out_zip = out_base / f'{name}.zip'
     out_dir = out_base / name
 
@@ -523,35 +694,45 @@ def download_model(name: str) -> None:
         return
 
     progress = build_progress(bar_type='download')
-    with requests.get(full, stream=True, allow_redirects=True) as req:
-        if req.status_code != 200:
-            raise ReqConnectionError(
-                f"Failed to download the model file: {full}. HTTP Response: {req.status_code}"
-            )
-
-        size = int(req.headers.get('Content-Length'))
-        chunk_size = 50 if 'small' in name else 300
-        task = progress.add_task("", size=size, noun=name, verb='Downloading')
-        progress.update(task, total=size)
-        with open(out_zip, 'wb') as dest_file:
-            with progress:
-                for chunk in req.iter_content(chunk_size=chunk_size):
-                    dest_file.write(chunk)
-                    progress.update(task, advance=len(chunk))
 
     try:
-        unpack_archive(out_zip, out_dir)
+        with requests.get(full_url, stream=True, allow_redirects=True, timeout=30) as req:
+            if req.status_code != 200:
+                raise ReqConnectionError(
+                    f"Failed to download the model file: {full_url}. HTTP Response: {req.status_code}"
+                )
+
+            size = int(req.headers.get('Content-Length', 0))
+            chunk_size = CHUNK_SIZE_SMALL if 'small' in name else CHUNK_SIZE_LARGE
+            task = progress.add_task("", size=size, noun=name, verb='Downloading')
+            progress.update(task, total=size)
+
+            with open(out_zip, 'wb') as dest_file:
+                with progress:
+                    for chunk in req.iter_content(chunk_size=chunk_size * 1024):
+                        if chunk:
+                            dest_file.write(chunk)
+                            progress.update(task, advance=len(chunk))
+    except RequestException as e:
+        con.print(f"[bold red]ERROR:[/] Failed to download model: {e}")
+        sys.exit(19)
+
+    try:
+        unpack_archive(str(out_zip), str(out_dir))
+
         if out_dir.exists():
             con.print("[bold green]SUCCESS![/] Model downloaded and extracted successfully")
             print("\n")
             out_zip.unlink()
-            child_dir = out_dir / name
+
             # If it extracts inside another directory, copy up and remove extra
+            child_dir = out_dir / name
             if child_dir.exists():
-                child_dir.rename(Path(f"{child_dir}-new"))
-                child_dir = copytree(Path(f"{child_dir}-new"), out_base / f"{name}-new")
+                temp_name = f"{name}-new"
+                child_dir.rename(out_base / temp_name)
+                child_dir_new = copytree(out_base / temp_name, out_base / temp_name + "-copy")
                 rmtree(out_dir)
-                child_dir.rename(Path(out_dir))
+                child_dir_new.rename(out_dir)
         elif out_zip.exists() and not out_dir.exists():
             con.print(
                 "[bold red]ERROR:[/] Model archive downloaded successfully, but failed to extract. "
@@ -565,87 +746,134 @@ def download_model(name: str) -> None:
                 "to download a model manually.\n"
             )
             sys.exit(5)
-    except Exception as e:
-        con.print(f"[bold red]CRITICAL:[/] Failed to unpack or rename the model: [red]{e}[/red]")
+    except (OSError, ValueError) as e:
+        con.print(f"[bold red]CRITICAL:[/] Failed to unpack or rename the model: {e}")
         sys.exit(29)
 
 
 def convert_time(time: str) -> str:
     """Convert timecodes for chapter markings.
 
-    Helper function to subtract 1 second from each start time which is used as the
-    end time for the previous chapter segment. If the update rolls over to a new
-    digit in the hour, minute, or second segments, adjust all necessary segments.
+    Subtracts 1 second from the given time to create end markers.
 
-    :param time: Timecode in Sexagesimal format
-    :return: Sexagesimal formatted time marker
+    :param time: Timecode in format HH:MM:SS.mmm
+    :return: Adjusted time marker
+    :raises ValueError: If time format is invalid
     """
-
     try:
+        # Parse the time string
         parts = time.split(':')
-        last, milliseconds = str(parts[-1]).split('.')
+        if len(parts) != 3:
+            raise ValueError(f"Invalid time format: {time}")
 
-        pattern = re.compile(r'0\d')
-        # Check for leading 0 and adjust time
-        if pattern.match(last):
-            # Adjust the hours position
-            if parts[1] == '00' and last == '00':
-                if pattern.match(parts[0]):
-                    first = f'0{str(int(parts[0]) - 1)}'
-                else:
-                    first = str(int(parts[0]) - 1)
-                parts = [first, '59', '59']
-            # Adjust the minutes position
-            elif last == '00':
-                if pattern.match(parts[1]):
-                    mid = f'0{str(int(parts[1]) - 1)}'
-                else:
-                    mid = str(int(parts[1]) - 1)
-                parts = [parts[0], mid, '59']
-            # Adjust the seconds position
-            else:
-                parts[-1] = f'0{str(int(last) - 1)}'
-        else:
-            parts[-1] = str(int(last) - 1)
-    except Exception as e:
-        con.print(f"[bold red]CRITICAL:[/] Could not covert end chapter marker for {time}: [red]{e}[/red]")
-        sys.exit(6)
+        last_part = parts[-1]
+        if '.' not in last_part:
+            raise ValueError(f"Missing milliseconds in time: {time}")
 
-    return f"{':'.join(parts)}.{milliseconds}"
+        seconds, milliseconds = last_part.split('.')
+
+        # Create a timedelta and subtract 1 second
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        secs = int(seconds)
+
+        # Convert to total seconds, subtract 1, then convert back
+        total_seconds = hours * 3600 + minutes * 60 + secs - 1
+
+        if total_seconds < 0:
+            total_seconds = 0
+
+        new_hours = total_seconds // 3600
+        new_minutes = (total_seconds % 3600) // 60
+        new_seconds = total_seconds % 60
+
+        return f"{new_hours:02d}:{new_minutes:02d}:{new_seconds:02d}.{milliseconds}"
+
+    except (ValueError, IndexError) as e:
+        con.print(f"[bold red]ERROR:[/] Could not convert end chapter marker for {time}: {e}")
+        raise
 
 
-def split_file(audiobook_path: PathLike,
+def split_file(audiobook_path: Path,
                timecodes: list[dict],
                metadata: dict,
-               cover_art: Optional[str]) -> None:
+               cover_art: Optional[Path],
+               ffmpeg: str,
+               output_format: str = 'auto') -> None:
+    """Splits a single audiobook file into chapterized segments.
 
-    """Splits a single .mp3 file into chapterized segments.
+    Supports MP3, M4B, and M4A formats. Output format can match input or be converted.
 
-    :param audiobook_path: Path to original .mp3 audiobook
+    :param audiobook_path: Path to original audiobook file
     :param timecodes: List of start/end markers for each chapter
     :param metadata: File metadata passed via CLI and/or parsed from audiobook file
     :param cover_art: Optional path to cover art
-    :return: An integer status code
+    :param ffmpeg: Path to ffmpeg executable
+    :param output_format: Output format - 'auto' (matches input), 'mp3', or 'm4b'
     """
-
     file_stem = audiobook_path.stem
-    # Set the log path for output. If it exists, generate new filename
-    log_path = audiobook_path.parent.joinpath('ffmpeg_log.txt')
+    file_ext = audiobook_path.suffix.lower()
+
+    # Determine output extension based on output_format parameter
+    if output_format == 'mp3':
+        output_ext = '.mp3'
+        requires_encoding = file_ext in ['.m4b', '.m4a']  # Need to re-encode M4B/M4A to MP3
+    elif output_format == 'm4b':
+        output_ext = '.m4b'
+        requires_encoding = file_ext == '.mp3'  # Need to re-encode MP3 to M4B
+    else:  # 'auto' - match input format
+        output_ext = file_ext if file_ext in ['.m4b', '.m4a'] else '.mp3'
+        requires_encoding = False  # Same format, use -c copy
+
+    # Inform user if re-encoding will occur
+    if requires_encoding:
+        con.print(f"[yellow]Note:[/] Converting {file_ext.upper()} → {output_ext.upper()} (requires re-encoding)")
+        print("\n")
+
+    # Set the log path for output
+    log_path = audiobook_path.parent / 'ffmpeg_log.txt'
+
     if log_path.exists():
-        with open(log_path, 'a+') as fp:
-            fp.writelines([
-                '********************************************************\n',
-                'NEW LOG START\n'
-                '********************************************************\n\n'
-            ])
-    command = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'info', '-i', f'{str(audiobook_path)}']
-    if cover_art:
-        command.extend(['-i', cover_art, '-id3v2_version', '3', '-metadata:s:v',
-                        'comment="Cover (front)"'])
-        stream = ['-map', '0:0', '-map', '1:0', '-c', 'copy']
+        try:
+            with open(log_path, 'a+', encoding='utf-8') as fp:
+                fp.writelines([
+                    '********************************************************\n',
+                    'NEW LOG START\n',
+                    '********************************************************\n\n'
+                ])
+        except OSError:
+            pass
+
+    command = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'info', '-i', str(audiobook_path)]
+
+    # Handle cover art and stream mapping based on output format and encoding requirements
+    if requires_encoding:
+        # Need to re-encode audio
+        if output_ext == '.mp3':
+            # Converting to MP3 - use libmp3lame encoder
+            if cover_art:
+                command.extend(['-i', str(cover_art), '-id3v2_version', '3', '-metadata:s:v', 'comment="Cover (front)"'])
+                stream = ['-map', '0:a', '-map', '1:0', '-c:a', 'libmp3lame', '-b:a', '192k', '-c:v', 'copy']
+            else:
+                command.extend(['-id3v2_version', '3'])
+                stream = ['-c:a', 'libmp3lame', '-b:a', '192k']
+        else:  # output_ext == '.m4b'
+            # Converting to M4B - use AAC encoder
+            stream = ['-c:a', 'aac', '-b:a', '192k']
     else:
-        command.extend(['-id3v2_version', '3'])
-        stream = ['-c', 'copy']
+        # Same format - use stream copy (fast, no quality loss)
+        if cover_art and output_ext == '.mp3':
+            # MP3: Add cover art via ID3v2 tags
+            command.extend(['-i', str(cover_art), '-id3v2_version', '3', '-metadata:s:v', 'comment="Cover (front)"'])
+            stream = ['-map', '0:0', '-map', '1:0', '-c', 'copy']
+        elif output_ext == '.mp3':
+            # MP3 without cover art
+            command.extend(['-id3v2_version', '3'])
+            stream = ['-c', 'copy']
+        else:
+            # M4B/M4A: Just copy audio stream, skip external cover art
+            # (Cover art from source M4B is preserved automatically with -c copy)
+            stream = ['-c', 'copy']
 
     # Handle metadata strings if they exist
     if 'album_artist' in metadata:
@@ -665,42 +893,167 @@ def split_file(audiobook_path: PathLike,
         command.extend(['-metadata', f"composer={metadata['narrator']}"])
 
     progress = build_progress(bar_type='chapterize')
+
     with progress:
         task = progress.add_task('', total=len(timecodes), verb='Processing', noun='Audiobook...')
+
         for counter, times in enumerate(timecodes, start=1):
-            counter = f'0{counter}' if counter < 10 else counter
+            counter_str = f'{counter:02d}'
             command_copy = command.copy()
+
             if 'start' in times:
                 command_copy[5:5] = ['-ss', times['start']]
             if 'end' in times:
                 command_copy[7:7] = ['-to', times['end']]
+
             if 'chapter_type' in times:
-                file_path = audiobook_path.parent.joinpath(f"{file_stem} {counter} - {times['chapter_type']}.mp3")
+                file_path = audiobook_path.parent / f"{file_stem} {counter_str} - {times['chapter_type']}{output_ext}"
             else:
-                file_path = audiobook_path.parent.joinpath(f"{file_stem} - {counter}.mp3")
+                file_path = audiobook_path.parent / f"{file_stem} - {counter_str}{output_ext}"
+
+            # Log which file is being created
+            chapter_name = times.get('chapter_type', f'Chapter {counter_str}')
+            con.print(f"[dim cyan]Creating ({counter}/{len(timecodes)}):[/] [green]{chapter_name}[/] → [blue]{file_path.name}[/]")
 
             track_num = ['-metadata', f"track={counter}/{len(timecodes)}"]
             command_copy.extend([*stream, *track_num, '-metadata', f"title={times['chapter_type']}",
-                                 f'{file_path}'])
+                                 str(file_path)])
 
             try:
-                with open(log_path, 'a+') as fp:
+                with open(log_path, 'a+', encoding='utf-8') as fp:
                     fp.write('----------------------------------------------------\n\n')
-                    subprocess.run(command_copy, stdout=fp, stderr=fp)
-            except Exception as e:
+                    subprocess.run(command_copy, stdout=fp, stderr=fp, check=False)
+            except OSError as e:
                 con.print(
                     f"[bold red]ERROR:[/] An exception occurred writing logs to file: "
-                    f"[red]{e}[/red]\nOutputting to stdout..."
+                    f"{e}\nOutputting to stdout..."
                 )
-                subprocess.run(command_copy, stdout=subprocess.STDOUT)
-
-            # Reset the list but keep reference
-            command_copy = None
+                subprocess.run(command_copy, stdout=subprocess.STDOUT, check=False)
 
             progress.update(task, advance=1)
 
 
-def generate_timecodes(audiobook_path: PathLike, language: str, model_type: str) -> Path:
+def generate_timecodes_smart(audiobook_path: Path,
+                            language: str,
+                            model_type: str,
+                            detection_method: str = 'auto') -> list[dict]:
+    """
+    Generate chapter timecodes using the specified or auto-detected method.
+
+    Supports multiple detection methods:
+    - auto: Intelligently choose best method (faster-whisper > Vosk fallback)
+    - vosk: Traditional Vosk ML transcription (slow but reliable)
+    - whisper: faster-whisper transcription (5-10x faster)
+    - hybrid: Silence detection + selective transcription
+    - silence: Pure silence detection (fastest, no ML)
+
+    :param audiobook_path: Path to input audiobook file
+    :param language: Language code for transcription
+    :param model_type: Model size (small/large)
+    :param detection_method: Detection method to use
+    :return: List of chapter dictionaries
+    :raises SystemExit: If method fails or dependencies missing
+    """
+    # Auto-detection logic
+    if detection_method == 'auto':
+        con.print("[cyan]Auto-detecting best chapter detection method...[/cyan]")
+
+        # Check if faster-whisper is available
+        try:
+            from faster_whisper import WhisperModel
+            detection_method = 'whisper'
+            con.print("[green]✓[/] faster-whisper available - using whisper method (5-10x faster)")
+        except ImportError:
+            detection_method = 'vosk'
+            con.print("[yellow]![/] faster-whisper not available - falling back to vosk")
+            con.print("[yellow]TIP:[/] Install faster-whisper for better performance: pip install faster-whisper")
+
+        print("\n")
+
+    # Execute the chosen method
+    if detection_method == 'vosk':
+        # Use traditional Vosk method
+        con.rule("[cyan]Generating Timecodes (Vosk ML)[/cyan]")
+        print("\n")
+
+        if model_type == 'small':
+            message = "[magenta]Sit tight, this might take a while[/magenta]..."
+        else:
+            message = "[magenta]Sit tight, this might take a [u]long[/u] while[/magenta]..."
+
+        with con.status(message, spinner='pong'):
+            timecodes_file = generate_timecodes(audiobook_path, language, model_type)
+
+        # Parse the SRT file
+        try:
+            with open(timecodes_file, 'r', encoding='utf-8') as fp:
+                file_lines = fp.readlines()
+        except (OSError, UnicodeDecodeError) as e:
+            con.print(f"[bold red]ERROR:[/] Failed to read timecodes file: {e}")
+            sys.exit(10)
+
+        con.rule("[cyan]Parsing Timecodes[/cyan]")
+        print("\n")
+
+        timecodes = parse_timecodes(file_lines, language)
+        con.print("[bold green]SUCCESS![/] Timecodes parsed")
+
+        return timecodes
+
+    elif detection_method in ['whisper', 'hybrid', 'silence']:
+        # Use alternative detection methods
+        if not ALTERNATIVES_AVAILABLE:
+            con.print(
+                "[bold red]ERROR:[/] Alternative detection methods not available. "
+                "Missing chapter_detection_alternatives.py module."
+            )
+            sys.exit(15)
+
+        # Map detection method to function
+        method_map = {
+            'whisper': ('faster-whisper', detect_by_whisper),
+            'hybrid': ('Hybrid (silence + ML)', detect_hybrid),
+            'silence': ('Silence Detection', detect_by_silence)
+        }
+
+        method_name, method_func = method_map[detection_method]
+        con.rule(f"[cyan]Generating Timecodes ({method_name})[/cyan]")
+        print("\n")
+
+        try:
+            # Call the detection function
+            if detection_method == 'whisper':
+                # Map model_type to whisper model size
+                whisper_model = 'base' if model_type == 'small' else 'small'
+                timecodes = method_func(audiobook_path, model_size=whisper_model, language=language[:2])
+            elif detection_method == 'hybrid':
+                timecodes = method_func(audiobook_path, model_size='tiny')
+            else:  # silence
+                timecodes = method_func(audiobook_path)
+
+            con.print(f"[bold green]SUCCESS![/] {len(timecodes)} chapters detected using {method_name}")
+            return timecodes
+
+        except ImportError as e:
+            con.print(f"[bold red]ERROR:[/] Missing dependencies for {method_name}: {e}")
+            con.print("\n[yellow]Install dependencies:[/]")
+            if detection_method == 'whisper':
+                con.print("  pip install faster-whisper")
+            elif detection_method == 'hybrid':
+                con.print("  pip install pydub faster-whisper")
+            else:  # silence
+                con.print("  pip install pydub")
+            sys.exit(16)
+        except Exception as e:
+            con.print(f"[bold red]ERROR:[/] {method_name} failed: {e}")
+            sys.exit(17)
+
+    else:
+        con.print(f"[bold red]ERROR:[/] Unknown detection method: {detection_method}")
+        sys.exit(18)
+
+
+def generate_timecodes(audiobook_path: Path, language: str, model_type: str) -> Path:
     """Generate chapter timecodes using vosk Machine Learning API.
 
     This function searches for the specified model/language within the project's 'models' directory and
@@ -712,23 +1065,24 @@ def generate_timecodes(audiobook_path: PathLike, language: str, model_type: str)
     :param language: Language used by the parser
     :param model_type: The type of model (large or small)
     :return: Path to timecode file
+    :raises SystemExit: If model cannot be loaded or timecode generation fails
     """
-
-    sample_rate = 16000
-    model_root = Path(r"model")
+    model_root = Path(__file__).parent / "model"
 
     # If the timecode file already exists, exit early and return path
     out_file = audiobook_path.with_suffix('.srt')
-    if out_file.exists() and out_file.stat().st_size > 10:
+    if out_file.exists() and out_file.stat().st_size > MIN_METADATA_SIZE:
         con.print("[bold green]SUCCESS![/] An existing srt timecode file was found")
         print("\n")
-
         return out_file
 
     try:
-        if model_path := [d for d in model_root.iterdir() if d.is_dir() and language in d.stem]:
+        model_path = [d for d in model_root.iterdir() if d.is_dir() and language in d.stem]
+
+        if model_path:
             print("\n")
             con.print(f":white_heavy_check_mark: Local ML model found. Language: '{language}'\n")
+
             # If there is more than 1 model, infer the proper one from the name
             if len(model_path) > 1:
                 con.print(
@@ -736,12 +1090,20 @@ def generate_timecodes(audiobook_path: PathLike, language: str, model_type: str)
                     f"Attempting to use the {model_type} model[/yellow]"
                 )
                 if model_type == 'small':
-                    model_path = [d for d in model_path if 'small' in d.stem][0]
+                    model_path = [d for d in model_path if 'small' in d.stem]
                 else:
-                    model_path = [d for d in model_path if 'small' not in d.stem][0]
+                    model_path = [d for d in model_path if 'small' not in d.stem]
+
+                if not model_path:
+                    raise IndexError("Could not find appropriate model size")
+
+                model_path = model_path[0]
             else:
                 model_path = model_path[0]
-    except IndexError:
+        else:
+            raise IndexError("No model found for language")
+
+    except (IndexError, OSError):
         con.print(
             "[bold yellow]WARNING:[/] Local ML model was not found (did you delete it?) "
             "or multiple models were found and the proper one couldn't be inferred.\n"
@@ -751,25 +1113,47 @@ def generate_timecodes(audiobook_path: PathLike, language: str, model_type: str)
         model_path = None
 
     SetLogLevel(-1)
-    model = Model(lang=language, model_path=str(model_path))
-    rec = KaldiRecognizer(model, sample_rate)
-    rec.SetWords(True)
 
     try:
-        # Convert the file to wav (if needed), and stream output to file
-        with subprocess.Popen([str(ffmpeg), "-loglevel", "quiet", "-i",
-                               audiobook_path,
-                               "-ar", str(sample_rate), "-ac", "1", "-f", "s16le", "-"],
-                              stdout=subprocess.PIPE).stdout as stream:
-            with open(out_file, 'w+') as fp:
-                fp.writelines(rec.SrtResult(stream))
-
-        con.print("[bold green]SUCCESS![/] Timecode file created\n")
+        model = Model(lang=language, model_path=str(model_path) if model_path else None)
+        rec = KaldiRecognizer(model, SAMPLE_RATE)
+        rec.SetWords(True)
     except Exception as e:
-        con.print(f"[bold red]ERROR:[/] Failed to generate timecode file with vosk: [red]{e}[/red]\n")
+        con.print(f"[bold red]ERROR:[/] Failed to load vosk model: {e}")
         sys.exit(7)
 
-    return Path(out_file)
+    try:
+        # Get ffmpeg path
+        ffmpeg = get_ffmpeg_path(parse_config())
+
+        # Convert the file to wav format and stream output
+        process = subprocess.Popen(
+            [ffmpeg, "-loglevel", "quiet", "-i", str(audiobook_path),
+             "-ar", str(SAMPLE_RATE), "-ac", str(AUDIO_CHANNELS), "-f", "s16le", "-"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+
+        with process.stdout as stream:
+            with open(out_file, 'w+', encoding='utf-8') as fp:
+                fp.writelines(rec.SrtResult(stream))
+
+        # Wait for process to complete
+        process.wait()
+
+        if process.returncode != 0:
+            stderr = process.stderr.read().decode('utf-8', errors='ignore') if process.stderr else ''
+            con.print(f"[bold yellow]WARNING:[/] ffmpeg process exited with code {process.returncode}")
+            if stderr:
+                con.print(f"[yellow]Error output: {stderr[:200]}[/]")
+
+        con.print("[bold green]SUCCESS![/] Timecode file created\n")
+
+    except (OSError, Exception) as e:
+        con.print(f"[bold red]ERROR:[/] Failed to generate timecode file with vosk: {e}\n")
+        sys.exit(7)
+
+    return out_file
 
 
 def parse_timecodes(srt_content: list, language: str = 'en-us') -> list[dict]:
@@ -781,10 +1165,11 @@ def parse_timecodes(srt_content: list, language: str = 'en-us') -> list[dict]:
     :param srt_content: List of timecodes extracted from the output of vosk
     :param language: Selected language. Used for importing excluded phrases
     :return: A list of dictionaries containing start, end, and chapter type data
+    :raises SystemExit: If language features are not configured or no timecodes found
     """
-
     # Get lang specific markers and excluded phrases
     excluded_phrases, markers = get_language_features(language)
+
     # If language features are None, they haven't been defined
     if not excluded_phrases or not markers:
         from model.models import get_lang_from_code
@@ -816,7 +1201,7 @@ def parse_timecodes(srt_content: list, language: str = 'en-us') -> list[dict]:
                 # Chapter X
                 elif markers[1] in srt_content[i+1]:
                     # Add leading zero for better sorting if < 10
-                    chapter_count = f'0{counter}' if counter < 10 else f'{counter}'
+                    chapter_count = f'{counter:02d}'
                     chapter_type = f'{markers[1].title()} {chapter_count}'
                     counter += 1
                 # Epilogue
@@ -827,20 +1212,23 @@ def parse_timecodes(srt_content: list, language: str = 'en-us') -> list[dict]:
 
                 # Build dict with start codes and marker
                 if len(timecodes) == 0:
-                    time_dict = {'start': '00:00:00', 'chapter_type': chapter_type}
+                    time_dict = {'start': '00:00:00.000', 'chapter_type': chapter_type}
                 else:
                     time_dict = {'start': start, 'chapter_type': chapter_type}
                 timecodes.append(time_dict)
             else:
                 con.print("[bold yellow]WARNING:[/] A timecode was skipped. A Start time failed to match")
                 continue
-        else:
-            continue
 
     # Add end key based on end time of next chapter minus one second for overlap
     for i, d in enumerate(timecodes):
         if i != len(timecodes) - 1:
-            d['end'] = convert_time(timecodes[i+1]['start'])
+            try:
+                d['end'] = convert_time(timecodes[i+1]['start'])
+            except ValueError as e:
+                con.print(f"[bold yellow]WARNING:[/] Failed to convert time for chapter {i+1}: {e}")
+                # Use the start time of next chapter as-is
+                d['end'] = timecodes[i+1]['start']
 
     if timecodes:
         return timecodes
@@ -849,19 +1237,21 @@ def parse_timecodes(srt_content: list, language: str = 'en-us') -> list[dict]:
         sys.exit(8)
 
 
-def verify_count(audiobook_path: PathLike, timecodes: list[dict]) -> None:
+def verify_count(audiobook_path: Path, timecodes: list[dict]) -> None:
     """Verify that the expected number of files were generated.
 
     Compares the number of files split from the audiobook to ensure it matches the length of the generated
-    timecodes.
+    timecodes. Checks for files with the same extension as the input file.
 
     :param audiobook_path: Path to audiobook file
     :param timecodes: List of dictionaries containing chapter type, start, and end times
-    :return: None (void)
     """
-
-    file_count = sum(1 for x in audiobook_path.parent.glob('*.mp3') if x.stem != audiobook_path.stem)
+    # Count files with same extension as input (excluding the original file)
+    file_ext = audiobook_path.suffix.lower()
+    pattern = f'*{file_ext}'
+    file_count = sum(1 for x in audiobook_path.parent.glob(pattern) if x.stem != audiobook_path.stem)
     expected = len(timecodes)
+
     if file_count >= expected:
         con.print(f"[bold green]SUCCESS![/] Audiobook split into {file_count} files\n")
     else:
@@ -871,7 +1261,7 @@ def verify_count(audiobook_path: PathLike, timecodes: list[dict]) -> None:
         )
 
 
-def write_cue_file(timecodes: list[dict], cue_path: PathLike) -> bool:
+def write_cue_file(timecodes: list[dict], cue_path: Path, audiobook_stem: str) -> bool:
     """Write audiobook timecodes to a cue file.
 
     Cue files can be created using the `-write_cue_file`/`-wc` argument. This provides the user with an
@@ -880,12 +1270,12 @@ def write_cue_file(timecodes: list[dict], cue_path: PathLike) -> bool:
 
     :param timecodes: Parsed timecodes to be written to the cue file
     :param cue_path: Path to cue file
+    :param audiobook_stem: Stem name of the audiobook file
     :return: Boolean success/failure flag
     """
-
     try:
-        with open(cue_path, 'x') as fp:
-            fp.write(f'FILE "{cue_path.stem}.mp3" MP3\n')
+        with open(cue_path, 'x', encoding='utf-8') as fp:
+            fp.write(f'FILE "{audiobook_stem}.mp3" MP3\n')
             for i, time in enumerate(timecodes, start=1):
                 fp.writelines([
                     f"TRACK {i} AUDIO\n",
@@ -894,48 +1284,58 @@ def write_cue_file(timecodes: list[dict], cue_path: PathLike) -> bool:
                 ])
                 if i != len(timecodes):
                     fp.write(f"  END\t\t{time['end']}\n")
+        return True
+
     except OSError as e:
-        con.print(f"[bold red]ERROR:[/] Failed to write cue file: [red]{e}[/]")
+        con.print(f"[bold red]ERROR:[/] Failed to write cue file: {e}")
         # Delete cue file to prevent parsing error if partially written
         if cue_path.exists():
-            cue_path.unlink()
+            try:
+                cue_path.unlink()
+            except OSError:
+                pass
         return False
 
-    return True
 
-def read_cue_file(cue_path: PathLike) -> list[dict] | None:
+def read_cue_file(cue_path: Path) -> Optional[list[dict]]:
     """Read audiobook timecodes from a cue file.
 
     Cue files can be created using the `-write_cue_file` argument. After creation, the cue file is
     used exclusively for reading timecodes unless an error occurs or the file is moved/renamed/deleted.
 
     :param cue_path: Path to cue file
-    :return: List of timecodes in dictionary form
+    :return: List of timecodes in dictionary form, or None if parsing fails
     """
-
     timecodes = []
     time_dict = {}
 
-    with open(cue_path, 'r') as fp:
-        content = fp.readlines()
+    try:
+        with open(cue_path, 'r', encoding='utf-8') as fp:
+            content = fp.readlines()
+    except (OSError, UnicodeDecodeError) as e:
+        con.print(f"[bold red]ERROR:[/] Failed to read cue file: {e}")
+        return None
+
     content = [l.strip('\n') for l in content]
 
-    for i, line in enumerate(content[1:]):
+    for i, line in enumerate(content[1:], start=1):
         try:
             if 'TITLE' in line:
-                time_dict['chapter_type'] = re.search(r'TITLE\t"(.*)"', line)[1]
+                if match := re.search(r'TITLE\t"(.*)"', line):
+                    time_dict['chapter_type'] = match[1]
             if 'START' in line:
-                time_dict['start'] = re.search(r'START\t(.+)', line)[1]
-            if 'END' in line and i != len(content) - 1:
-                time_dict['end'] = re.search(r'END\t+(.+)', line)[1]
+                if match := re.search(r'START\t(.+)', line):
+                    time_dict['start'] = match[1]
+            if 'END' in line and i < len(content):
+                if match := re.search(r'END\t+(.+)', line):
+                    time_dict['end'] = match[1]
+
         except (ValueError, IndexError) as e:
-            con.print(f"[bold red]ERROR:[/] Failed to match line: [red]{e}[/]. Returning...")
-            return None
-        except Exception as e:
-            con.print(f"[bold red]ERROR:[/] Failed to match line: [red]{e}[/]. Returning...")
+            con.print(f"[bold red]ERROR:[/] Failed to match line {i}: {e}. Returning...")
             return None
 
-        if 'TRACK' in content[i+1] and time_dict:
+        # Check if we've completed a track entry
+        if i < len(content) and 'TRACK' in content[i] and time_dict:
             timecodes.append(time_dict)
             time_dict = {}
         elif line == content[-1] and time_dict:
@@ -945,7 +1345,7 @@ def read_cue_file(cue_path: PathLike) -> list[dict] | None:
         return timecodes
     else:
         con.print(
-            f"[bold red]ERROR:[/] Timecodes read from cue file cannot be empty. "
+            "[bold red]ERROR:[/] Timecodes read from cue file cannot be empty. "
             "Timecodes will be parsed normally until the error is corrected."
         )
         return None
@@ -954,9 +1354,9 @@ def read_cue_file(cue_path: PathLike) -> list[dict] | None:
 def main():
     """
     Main driver function.
-
-    :return: None
     """
+    # Start total execution timer
+    script_start_time = time.time()
 
     print("\n\n")
     con.rule("[cyan]Starting script[/cyan]")
@@ -970,15 +1370,105 @@ def main():
         sys.exit(20)
 
     # Destructure tuple
-    audiobook_file, in_metadata, lang, model_name, model_type, cue_file = parse_args()
-    if not str(audiobook_file).endswith('.mp3'):
-        con.print("[bold red]ERROR:[/] The script only works with .mp3 files (for now)")
+    audiobook_file, in_metadata, lang, model_name, model_type, cue_file, ffmpeg, use_existing_chapters, detection_method, output_format = parse_args()
+
+    # Check supported file formats
+    supported_formats = ['.mp3', '.m4b', '.m4a']
+    file_ext = audiobook_file.suffix.lower()
+
+    if file_ext not in supported_formats:
+        con.print(f"[bold red]ERROR:[/] Unsupported format: {file_ext}")
+        con.print(f"[yellow]Supported formats:[/] {', '.join(supported_formats)}")
         sys.exit(9)
 
-    # Extract metadata from input file
-    con.rule("[cyan]Extracting metadata[/cyan]")
-    print("\n")
-    parsed_metadata = extract_metadata(audiobook_file)
+    # Try to extract existing chapters from M4B/M4A files first
+    if file_ext in ['.m4b', '.m4a']:
+        con.print(f"[cyan]M4B/M4A file detected:[/] {audiobook_file.name}")
+        con.print("[magenta]Checking for existing chapter markers...[/]")
+
+        try:
+            from m4b_support import get_m4b_chapters, get_m4b_metadata
+
+            # Start timing M4B extraction
+            m4b_start_time = time.time()
+
+            # Try to extract existing chapters
+            existing_chapters = get_m4b_chapters(audiobook_file, ffmpeg)
+
+            if existing_chapters:
+                m4b_elapsed = time.time() - m4b_start_time
+                con.print(f"[bold green]SUCCESS![/] Found {len(existing_chapters)} embedded chapters")
+                con.print(f"[dim]⏱ M4B extraction: {format_elapsed_time(m4b_elapsed)}[/dim]")
+                print("\n")
+                timecodes = existing_chapters
+
+                # Also extract M4B metadata
+                m4b_metadata = get_m4b_metadata(audiobook_file)
+                if m4b_metadata:
+                    con.print("[magenta]Merging M4B metadata...[/]")
+                    parsed_metadata = m4b_metadata
+                    if in_metadata:
+                        parsed_metadata |= in_metadata
+
+                # Skip transcription, go directly to printing chapters
+                print_table(timecodes)
+                print("\n")
+
+                # Determine whether to use existing chapters
+                if use_existing_chapters:
+                    # Flag set - use existing chapters without prompting
+                    con.print("[cyan]Using existing chapters (--use-existing-chapters flag set)[/]")
+                    choice = "1"
+                elif not sys.stdin.isatty():
+                    # Running non-interactively - auto-select existing chapters
+                    con.print("[cyan]Non-interactive mode detected - using existing chapters[/]")
+                    choice = "1"
+                else:
+                    # Interactive mode - ask user
+                    con.print("[yellow]M4B file already has chapters. Options:[/]")
+                    con.print("  1. Use existing chapters (fast, recommended)")
+                    con.print("  2. Re-detect chapters with ML (slow, may find different breaks)")
+                    choice = input("\nChoice [1/2] (default: 1): ").strip() or "1"
+
+                if choice == "1":
+                    # Use existing chapters - skip to file splitting
+                    con.rule("[cyan]Using Existing M4B Chapters[/cyan]")
+                    print("\n")
+                else:
+                    # Continue with ML detection
+                    con.print("[yellow]Continuing with ML chapter detection...[/]")
+                    print("\n")
+                    timecodes = None  # Reset to trigger detection
+            else:
+                con.print("[yellow]No embedded chapters found - will use ML detection[/]")
+                print("\n")
+                timecodes = None
+        except ImportError:
+            con.print("[yellow]m4b_support module not found - using ML detection[/]")
+            print("\n")
+            timecodes = None
+        except Exception as e:
+            con.print(f"[yellow]Could not extract M4B chapters: {e}[/]")
+            con.print("[yellow]Falling back to ML detection[/]")
+            print("\n")
+            timecodes = None
+    else:
+        timecodes = None
+
+    # Extract metadata from input file (skip if already extracted from M4B)
+    if file_ext in ['.m4b', '.m4a'] and 'parsed_metadata' in locals() and parsed_metadata:
+        # Already extracted from M4B
+        con.rule("[cyan]Using M4B Metadata[/cyan]")
+        print("\n")
+    else:
+        con.rule("[cyan]Extracting metadata[/cyan]")
+        print("\n")
+        metadata_start_time = time.time()
+        parsed_metadata = extract_metadata(audiobook_file, ffmpeg)
+        metadata_elapsed = time.time() - metadata_start_time
+        con.print(f"[dim]⏱ Metadata extraction: {format_elapsed_time(metadata_elapsed)}[/dim]")
+        print("\n")
+
     # Combine the dicts, overwriting existing keys with user values if passed
     if parsed_metadata and in_metadata:
         con.print("[magenta]Merging extracted and user metadata[/magenta]...")
@@ -992,23 +1482,30 @@ def main():
     elif in_metadata and not parsed_metadata:
         parsed_metadata = in_metadata
         print("\n")
+
     con.print(Panel(Pretty(parsed_metadata), title="ID3 Metadata"))
     print("\n")
 
     # Search for existing cover art
     con.rule("[cyan]Discovering Cover Art[/cyan]")
     print("\n")
-    if not parsed_metadata['cover_art']:
+
+    coverart_start_time = time.time()
+    if not parsed_metadata.get('cover_art'):
         con.print("[magenta]Perusing for cover art in source[/magenta]...")
-        cover_art = extract_coverart(audiobook_file)
+        cover_art = extract_coverart(audiobook_file, ffmpeg)
     else:
-        if parsed_metadata['cover_art'].exists():
+        cover_art_path = parsed_metadata['cover_art']
+        if isinstance(cover_art_path, Path) and cover_art_path.exists():
             con.print("[bold green]SUCCESS![/] Cover art is...covered!")
             print("\n")
-            cover_art = parsed_metadata['cover_art']
+            cover_art = cover_art_path
         else:
             con.print("[bold yellow]WARNING:[/] Cover art path does not exist")
             cover_art = None
+    coverart_elapsed = time.time() - coverart_start_time
+    con.print(f"[dim]⏱ Cover art: {format_elapsed_time(coverart_elapsed)}[/dim]")
+    print("\n")
 
     # Download model if option selected
     if model_name and lang:
@@ -1018,47 +1515,34 @@ def main():
         print("\n")
         download_model(model_name)
 
-    # Generate timecodes from mp3 file
-    con.rule("[cyan]Generating Timecodes[/cyan]")
-    print("\n")
-    if model_type == 'small':
-        message = "[magenta]Sit tight, this might take a while[/magenta]..."
-    else:
-        message = "[magenta]Sit tight, this might take a [u]long[/u] while[/magenta]..."
-    with con.status(message, spinner='pong'):
-        timecodes_file = generate_timecodes(audiobook_file, lang, model_type)
+    # Generate timecodes from audio file (skip if already have from M4B)
+    if 'timecodes' not in locals() or timecodes is None:
+        # Start timing chapter detection
+        detection_start_time = time.time()
 
-    # If cue file exists, read timecodes from file
-    if cue_file and cue_file.exists():
-        con.rule("[cyan]Reading Cue File[/cyan]")
+        # Use smart detection to choose best method
+        timecodes = generate_timecodes_smart(audiobook_file, lang, model_type, detection_method)
+
+        # Calculate and display detection time
+        detection_elapsed = time.time() - detection_start_time
         print("\n")
+        con.print(f"[bold green]✓ Chapter detection completed in {format_elapsed_time(detection_elapsed)}[/]")
 
-        if (timecodes := read_cue_file(cue_file)) is not None:
-            con.print("[bold green]SUCCESS![/] Timecodes parsed from cue file")
-    else:
-        timecodes = None
-
-    # If timecodes not parsed from cue file, parse from srt
-    if not timecodes:
-        # Open file and parse timecodes
-        with open(timecodes_file, 'r') as fp:
-            file_lines = fp.readlines()
-        con.rule("[cyan]Parsing Timecodes[/cyan]")
+        # Print timecodes table
         print("\n")
-
-        timecodes = parse_timecodes(file_lines, lang)
-        con.print("[bold green]SUCCESS![/] Timecodes parsed")
-
-    # Print timecodes table
-    print("\n")
-    print_table(timecodes)
-    print("\n")
+        print_table(timecodes)
+        print("\n")
+    else:
+        # Already have timecodes from M4B
+        con.print("[cyan]Using timecodes from M4B file[/cyan]")
+        print("\n")
 
     # Generate cue file if selected and one doesn't already exist
     con.rule("[cyan]Writing Cue File[/cyan]")
     print("\n")
+
     if cue_file and not cue_file.exists():
-        if (success := write_cue_file(timecodes, cue_file)) is True:
+        if write_cue_file(timecodes, cue_file, audiobook_file.stem):
             con.print("[bold green]SUCCESS![/] Cue file created")
     elif cue_file and cue_file.exists():
         con.print(
@@ -1071,10 +1555,52 @@ def main():
     # Split the file
     con.rule("[cyan]Chapterizing File[/cyan]")
     print("\n")
-    split_file(audiobook_file, timecodes, parsed_metadata, cover_art)
+
+    # Start timing file splitting
+    splitting_start_time = time.time()
+
+    split_file(audiobook_file, timecodes, parsed_metadata, cover_art, ffmpeg, output_format)
+
+    # Calculate and display splitting time
+    splitting_elapsed = time.time() - splitting_start_time
+    print("\n")
+    con.print(f"[bold green]✓ File splitting completed in {format_elapsed_time(splitting_elapsed)}[/]")
+    print("\n")
 
     # Count the generated files and compare to timecode dict to ensure they match
     verify_count(audiobook_file, timecodes)
+
+    # Calculate and display total elapsed time
+    total_elapsed = time.time() - script_start_time
+    print("\n")
+    con.rule("[bold green]🎉 Complete![/bold green]")
+    print("\n")
+
+    # Create timing summary table
+    timing_table = Table(title="[bold cyan]Execution Time Summary[/]", show_header=True, header_style="bold magenta")
+    timing_table.add_column("Phase", style="cyan", no_wrap=True)
+    timing_table.add_column("Duration", style="green", justify="right")
+
+    # Add timing rows based on what was executed
+    if file_ext in ['.m4b', '.m4a'] and 'timecodes' in locals() and timecodes and 'm4b_elapsed' in locals():
+        timing_table.add_row("M4B chapter extraction", format_elapsed_time(m4b_elapsed))
+
+    if 'metadata_elapsed' in locals():
+        timing_table.add_row("Metadata extraction", format_elapsed_time(metadata_elapsed))
+
+    if 'coverart_elapsed' in locals():
+        timing_table.add_row("Cover art extraction", format_elapsed_time(coverart_elapsed))
+
+    if 'detection_elapsed' in locals():
+        timing_table.add_row("Chapter detection (ML)", format_elapsed_time(detection_elapsed))
+
+    if 'splitting_elapsed' in locals():
+        timing_table.add_row("File splitting", format_elapsed_time(splitting_elapsed))
+
+    timing_table.add_row("[bold]TOTAL[/]", f"[bold]{format_elapsed_time(total_elapsed)}[/]")
+
+    con.print(timing_table)
+    print("\n")
 
 
 if __name__ == '__main__':

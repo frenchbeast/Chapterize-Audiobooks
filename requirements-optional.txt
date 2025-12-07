@@ -1,0 +1,16 @@
+# Optional dependencies for alternative chapter detection methods
+# Install with: pip install -r requirements-optional.txt
+
+# For silence-based detection (fastest method)
+pydub>=0.25.1
+
+# For faster-whisper detection (recommended method)
+# Much faster than Vosk, more accurate
+faster-whisper>=0.10.0
+
+# For GPU acceleration (optional, NVIDIA GPUs only)
+# Uncomment if you have CUDA-capable GPU:
+# faster-whisper[cuda]>=0.10.0
+
+# For hybrid detection (combines silence + whisper)
+# Install both pydub and faster-whisper above
