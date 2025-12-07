@@ -6,36 +6,32 @@
 # M4B/M4A files (instant - uses existing chapters):
 python chapterize_ab.py audiobook.m4b --title "Book Title"
 
-# MP3 files (auto-detects best method):
+# MP3 files (uses Vosk by default - reliable and tested):
 python chapterize_ab.py audiobook.mp3 --title "Book Title"
 ```
 
-## Make It 5-10x Faster (Recommended)
+## Optional: Try Alternative Methods
 
 ```bash
-# Install faster detection (one-time):
-pip install faster-whisper
+# Silence detection (fast but no chapter names):
+python chapterize_ab.py audiobook.mp3 --detection-method silence --title "Title"
 
-# Use the script normally - it auto-detects faster-whisper!
-python chapterize_ab.py audiobook.mp3 --title "Book Title"
+# faster-whisper (may be faster/slower depending on your system):
+python chapterize_ab.py audiobook.mp3 --detection-method whisper --title "Title"
+# Note: Install first with: pip install faster-whisper
+
+# Force Vosk explicitly:
+python chapterize_ab.py audiobook.mp3 --detection-method vosk --title "Title"
 ```
 
-**That's it!** The script automatically uses the fastest method available.
+## Performance Notes
 
-## Manual Method Selection (Optional)
+Processing time varies significantly based on:
+- Your CPU/GPU hardware
+- File size and duration
+- Detection method chosen
 
-```bash
-# Force a specific method:
-python chapterize_ab.py audiobook.mp3 --detection-method whisper  # 5-10x faster
-python chapterize_ab.py audiobook.mp3 --detection-method hybrid   # 10-15x faster
-python chapterize_ab.py audiobook.mp3 --detection-method silence  # 100x faster (no names)
-python chapterize_ab.py audiobook.mp3 --detection-method vosk     # Default (slow)
-```
+**Best practice**: Test with a small file first to see which method works best on your system.
 
-## Time Comparison (12-hour audiobook)
+For M4B files with embedded chapters, extraction is always instant (~10 seconds).
 
-- **M4B with chapters**: ~10 seconds ⚡
-- **MP3 + faster-whisper**: ~38 minutes 🚀
-- **MP3 + Vosk (default)**: ~4 hours 23 minutes 🐌
-
-Install faster-whisper to save hours!

@@ -4,6 +4,7 @@ import re
 import subprocess
 import argparse
 import sys
+import time
 from typing import Optional
 from pathlib import Path
 from shutil import unpack_archive, copytree, rmtree, which
@@ -120,6 +121,25 @@ class Config:
 '''
     Utility Function Declarations
 '''
+
+
+def format_elapsed_time(seconds: float) -> str:
+    """Format elapsed time in seconds to a readable string.
+
+    :param seconds: Elapsed time in seconds
+    :return: Formatted string (e.g., "2h 15m 30s" or "45m 12s" or "23s")
+    """
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        mins = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{mins}m {secs}s"
+    else:
+        hours = int(seconds // 3600)
+        mins = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        return f"{hours}h {mins}m {secs}s"
 
 
 def path_exists(path: Path | str) -> Path:
@@ -386,6 +406,13 @@ def parse_args():
                              'M4B embedded chapters > faster-whisper > Vosk fallback. '
                              'Manual options: vosk (slow, default ML), whisper (5-10x faster), '
                              'hybrid (silence + selective transcription), silence (fastest, no ML)')
+    parser.add_argument('--output-format', '-of', dest='output_format',
+                        choices=['auto', 'mp3', 'm4b'],
+                        default='auto',
+                        help='Output file format. "auto" matches input format (M4B→M4B, MP3→MP3). '
+                             'Use "mp3" to convert M4B to MP3 for better compatibility (e.g., Apple Music). '
+                             'Note: Converting to MP3 requires re-encoding (slower, slight quality loss). '
+                             'Default: auto')
 
     args = parser.parse_args()
     config = parse_config()
@@ -490,7 +517,7 @@ def parse_args():
     # Get ffmpeg path
     ffmpeg = get_ffmpeg_path(config)
 
-    return args.audiobook, meta_fields, language, model_name, model_type, cue_file, ffmpeg, args.use_existing, args.detection_method
+    return args.audiobook, meta_fields, language, model_name, model_type, cue_file, ffmpeg, args.use_existing, args.detection_method, args.output_format
 
 
 def build_progress(bar_type: str) -> Progress:
@@ -771,24 +798,37 @@ def split_file(audiobook_path: Path,
                timecodes: list[dict],
                metadata: dict,
                cover_art: Optional[Path],
-               ffmpeg: str) -> None:
+               ffmpeg: str,
+               output_format: str = 'auto') -> None:
     """Splits a single audiobook file into chapterized segments.
 
-    Supports MP3, M4B, and M4A formats. Output format matches input format
-    to preserve codec quality with -c copy.
+    Supports MP3, M4B, and M4A formats. Output format can match input or be converted.
 
     :param audiobook_path: Path to original audiobook file
     :param timecodes: List of start/end markers for each chapter
     :param metadata: File metadata passed via CLI and/or parsed from audiobook file
     :param cover_art: Optional path to cover art
     :param ffmpeg: Path to ffmpeg executable
+    :param output_format: Output format - 'auto' (matches input), 'mp3', or 'm4b'
     """
     file_stem = audiobook_path.stem
     file_ext = audiobook_path.suffix.lower()
 
-    # Determine output extension (must match input codec)
-    # M4B/M4A use AAC codec, MP3 uses MP3 codec
-    output_ext = file_ext if file_ext in ['.m4b', '.m4a'] else '.mp3'
+    # Determine output extension based on output_format parameter
+    if output_format == 'mp3':
+        output_ext = '.mp3'
+        requires_encoding = file_ext in ['.m4b', '.m4a']  # Need to re-encode M4B/M4A to MP3
+    elif output_format == 'm4b':
+        output_ext = '.m4b'
+        requires_encoding = file_ext == '.mp3'  # Need to re-encode MP3 to M4B
+    else:  # 'auto' - match input format
+        output_ext = file_ext if file_ext in ['.m4b', '.m4a'] else '.mp3'
+        requires_encoding = False  # Same format, use -c copy
+
+    # Inform user if re-encoding will occur
+    if requires_encoding:
+        con.print(f"[yellow]Note:[/] Converting {file_ext.upper()} → {output_ext.upper()} (requires re-encoding)")
+        print("\n")
 
     # Set the log path for output
     log_path = audiobook_path.parent / 'ffmpeg_log.txt'
@@ -806,21 +846,34 @@ def split_file(audiobook_path: Path,
 
     command = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'info', '-i', str(audiobook_path)]
 
-    # Handle cover art and stream mapping
-    # Note: M4B/M4A containers don't support adding JPEG cover art via stream mapping
-    # Cover art in M4B files is usually already embedded in the source
-    if cover_art and output_ext == '.mp3':
-        # MP3: Add cover art via ID3v2 tags
-        command.extend(['-i', str(cover_art), '-id3v2_version', '3', '-metadata:s:v', 'comment="Cover (front)"'])
-        stream = ['-map', '0:0', '-map', '1:0', '-c', 'copy']
-    elif output_ext == '.mp3':
-        # MP3 without cover art
-        command.extend(['-id3v2_version', '3'])
-        stream = ['-c', 'copy']
+    # Handle cover art and stream mapping based on output format and encoding requirements
+    if requires_encoding:
+        # Need to re-encode audio
+        if output_ext == '.mp3':
+            # Converting to MP3 - use libmp3lame encoder
+            if cover_art:
+                command.extend(['-i', str(cover_art), '-id3v2_version', '3', '-metadata:s:v', 'comment="Cover (front)"'])
+                stream = ['-map', '0:a', '-map', '1:0', '-c:a', 'libmp3lame', '-b:a', '192k', '-c:v', 'copy']
+            else:
+                command.extend(['-id3v2_version', '3'])
+                stream = ['-c:a', 'libmp3lame', '-b:a', '192k']
+        else:  # output_ext == '.m4b'
+            # Converting to M4B - use AAC encoder
+            stream = ['-c:a', 'aac', '-b:a', '192k']
     else:
-        # M4B/M4A: Just copy audio stream, skip external cover art
-        # (Cover art from source M4B is preserved automatically with -c copy)
-        stream = ['-c', 'copy']
+        # Same format - use stream copy (fast, no quality loss)
+        if cover_art and output_ext == '.mp3':
+            # MP3: Add cover art via ID3v2 tags
+            command.extend(['-i', str(cover_art), '-id3v2_version', '3', '-metadata:s:v', 'comment="Cover (front)"'])
+            stream = ['-map', '0:0', '-map', '1:0', '-c', 'copy']
+        elif output_ext == '.mp3':
+            # MP3 without cover art
+            command.extend(['-id3v2_version', '3'])
+            stream = ['-c', 'copy']
+        else:
+            # M4B/M4A: Just copy audio stream, skip external cover art
+            # (Cover art from source M4B is preserved automatically with -c copy)
+            stream = ['-c', 'copy']
 
     # Handle metadata strings if they exist
     if 'album_artist' in metadata:
@@ -857,6 +910,10 @@ def split_file(audiobook_path: Path,
                 file_path = audiobook_path.parent / f"{file_stem} {counter_str} - {times['chapter_type']}{output_ext}"
             else:
                 file_path = audiobook_path.parent / f"{file_stem} - {counter_str}{output_ext}"
+
+            # Log which file is being created
+            chapter_name = times.get('chapter_type', f'Chapter {counter_str}')
+            con.print(f"[dim cyan]Creating ({counter}/{len(timecodes)}):[/] [green]{chapter_name}[/] → [blue]{file_path.name}[/]")
 
             track_num = ['-metadata', f"track={counter}/{len(timecodes)}"]
             command_copy.extend([*stream, *track_num, '-metadata', f"title={times['chapter_type']}",
@@ -1298,6 +1355,9 @@ def main():
     """
     Main driver function.
     """
+    # Start total execution timer
+    script_start_time = time.time()
+
     print("\n\n")
     con.rule("[cyan]Starting script[/cyan]")
     print("\n")
@@ -1310,7 +1370,7 @@ def main():
         sys.exit(20)
 
     # Destructure tuple
-    audiobook_file, in_metadata, lang, model_name, model_type, cue_file, ffmpeg, use_existing_chapters, detection_method = parse_args()
+    audiobook_file, in_metadata, lang, model_name, model_type, cue_file, ffmpeg, use_existing_chapters, detection_method, output_format = parse_args()
 
     # Check supported file formats
     supported_formats = ['.mp3', '.m4b', '.m4a']
@@ -1329,11 +1389,16 @@ def main():
         try:
             from m4b_support import get_m4b_chapters, get_m4b_metadata
 
+            # Start timing M4B extraction
+            m4b_start_time = time.time()
+
             # Try to extract existing chapters
             existing_chapters = get_m4b_chapters(audiobook_file, ffmpeg)
 
             if existing_chapters:
+                m4b_elapsed = time.time() - m4b_start_time
                 con.print(f"[bold green]SUCCESS![/] Found {len(existing_chapters)} embedded chapters")
+                con.print(f"[dim]⏱ M4B extraction: {format_elapsed_time(m4b_elapsed)}[/dim]")
                 print("\n")
                 timecodes = existing_chapters
 
@@ -1398,7 +1463,11 @@ def main():
     else:
         con.rule("[cyan]Extracting metadata[/cyan]")
         print("\n")
+        metadata_start_time = time.time()
         parsed_metadata = extract_metadata(audiobook_file, ffmpeg)
+        metadata_elapsed = time.time() - metadata_start_time
+        con.print(f"[dim]⏱ Metadata extraction: {format_elapsed_time(metadata_elapsed)}[/dim]")
+        print("\n")
 
     # Combine the dicts, overwriting existing keys with user values if passed
     if parsed_metadata and in_metadata:
@@ -1421,6 +1490,7 @@ def main():
     con.rule("[cyan]Discovering Cover Art[/cyan]")
     print("\n")
 
+    coverart_start_time = time.time()
     if not parsed_metadata.get('cover_art'):
         con.print("[magenta]Perusing for cover art in source[/magenta]...")
         cover_art = extract_coverart(audiobook_file, ffmpeg)
@@ -1433,6 +1503,9 @@ def main():
         else:
             con.print("[bold yellow]WARNING:[/] Cover art path does not exist")
             cover_art = None
+    coverart_elapsed = time.time() - coverart_start_time
+    con.print(f"[dim]⏱ Cover art: {format_elapsed_time(coverart_elapsed)}[/dim]")
+    print("\n")
 
     # Download model if option selected
     if model_name and lang:
@@ -1444,8 +1517,16 @@ def main():
 
     # Generate timecodes from audio file (skip if already have from M4B)
     if 'timecodes' not in locals() or timecodes is None:
+        # Start timing chapter detection
+        detection_start_time = time.time()
+
         # Use smart detection to choose best method
         timecodes = generate_timecodes_smart(audiobook_file, lang, model_type, detection_method)
+
+        # Calculate and display detection time
+        detection_elapsed = time.time() - detection_start_time
+        print("\n")
+        con.print(f"[bold green]✓ Chapter detection completed in {format_elapsed_time(detection_elapsed)}[/]")
 
         # Print timecodes table
         print("\n")
@@ -1474,10 +1555,52 @@ def main():
     # Split the file
     con.rule("[cyan]Chapterizing File[/cyan]")
     print("\n")
-    split_file(audiobook_file, timecodes, parsed_metadata, cover_art, ffmpeg)
+
+    # Start timing file splitting
+    splitting_start_time = time.time()
+
+    split_file(audiobook_file, timecodes, parsed_metadata, cover_art, ffmpeg, output_format)
+
+    # Calculate and display splitting time
+    splitting_elapsed = time.time() - splitting_start_time
+    print("\n")
+    con.print(f"[bold green]✓ File splitting completed in {format_elapsed_time(splitting_elapsed)}[/]")
+    print("\n")
 
     # Count the generated files and compare to timecode dict to ensure they match
     verify_count(audiobook_file, timecodes)
+
+    # Calculate and display total elapsed time
+    total_elapsed = time.time() - script_start_time
+    print("\n")
+    con.rule("[bold green]🎉 Complete![/bold green]")
+    print("\n")
+
+    # Create timing summary table
+    timing_table = Table(title="[bold cyan]Execution Time Summary[/]", show_header=True, header_style="bold magenta")
+    timing_table.add_column("Phase", style="cyan", no_wrap=True)
+    timing_table.add_column("Duration", style="green", justify="right")
+
+    # Add timing rows based on what was executed
+    if file_ext in ['.m4b', '.m4a'] and 'timecodes' in locals() and timecodes and 'm4b_elapsed' in locals():
+        timing_table.add_row("M4B chapter extraction", format_elapsed_time(m4b_elapsed))
+
+    if 'metadata_elapsed' in locals():
+        timing_table.add_row("Metadata extraction", format_elapsed_time(metadata_elapsed))
+
+    if 'coverart_elapsed' in locals():
+        timing_table.add_row("Cover art extraction", format_elapsed_time(coverart_elapsed))
+
+    if 'detection_elapsed' in locals():
+        timing_table.add_row("Chapter detection (ML)", format_elapsed_time(detection_elapsed))
+
+    if 'splitting_elapsed' in locals():
+        timing_table.add_row("File splitting", format_elapsed_time(splitting_elapsed))
+
+    timing_table.add_row("[bold]TOTAL[/]", f"[bold]{format_elapsed_time(total_elapsed)}[/]")
+
+    con.print(timing_table)
+    print("\n")
 
 
 if __name__ == '__main__':

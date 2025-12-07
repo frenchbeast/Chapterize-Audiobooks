@@ -312,6 +312,12 @@ optional arguments:
 ```
 
 ```bash
+# M4B to MP3 conversion (for Apple Music compatibility)
+~$ python3 ./chapterize_ab.py '/path/to/audiobook/file.m4b' --output-format mp3
+# Converts M4B chapters to MP3 files (requires re-encoding, slower but more compatible)
+```
+
+```bash
 # Adding the title and genre metadata fields
 ~$ python3 ./chapterize_ab.py '/path/to/audiobook/file.mp3' --title 'Game of Thrones' --genre 'Fantasy'
 ```
